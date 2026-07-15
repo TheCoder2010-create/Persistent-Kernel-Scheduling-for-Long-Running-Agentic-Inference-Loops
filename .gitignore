@@ -1,0 +1,63 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
+*.nav
+*.snm
+*.vrb
+
+# Generated PDFs (compiled output — source is paper.tex)
+*.pdf
+
+# Ephemeral build/run scripts
+compile.bat
+run.bat
+
+# CUDA build artifacts
+*.exe
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+# Intermediate nvcc files
+*.cudafe1.cpp
+*.cudafe1.gpu
+*.cudafe1.stub.c
+*.fatbin
+*.fatbin.c
+*.hash
+*.ptx
+*.cubin
+tmpxft_*
+
+# Benchmark results (raw data — keep sim_results.json as canonical reference)
+benchmarks/results/*.json
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store

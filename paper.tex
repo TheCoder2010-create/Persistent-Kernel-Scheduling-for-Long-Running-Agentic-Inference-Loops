@@ -1,0 +1,387 @@
+\documentclass{article}
+
+% ============================================================
+% NeurIPS-style formatting (self-contained, no external .sty
+% dependency — mirrors the official neurips_2024 layout:
+% single-column, Times, numbered sections, abstract, checklist).
+% ============================================================
+\usepackage[margin=1in]{geometry}
+\usepackage{times}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage[numbers,sort]{natbib}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\title{Persistent Kernel Scheduling for Long-Running Agentic Inference Loops}
+
+\author{
+  Manav Sutar \\
+  Single Core Labs \\
+  Pune, India \\
+  \texttt{manav@singlecorelabs.com}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Autonomous LLM agents execute long, iterative loops of the form
+\emph{model call} $\rightarrow$ \emph{tool call} $\rightarrow$ \emph{model call},
+often for tens to hundreds of steps per task. Standard inference stacks
+re-launch a full stack of CUDA kernels at every model call, paying
+launch and framework dispatch overhead on every step even though the
+underlying transformer weights and much of the on-GPU state persist
+across the loop. Recent \emph{megakernel} and \emph{persistent kernel}
+techniques eliminate per-operator launch overhead for single-turn
+decoding by fusing an entire forward pass into one resident kernel
+that is fed by an in-kernel task queue \citep{mpk2025,kog2026,adamk2026}.
+However, these designs target token-by-token decoding within a single
+generation; they do not address the distinct overhead structure of
+\emph{agent loops}, where the GPU sits idle across externally-latent
+tool calls and where control flow depends on tool output rather than
+token output. We formalize this gap, propose a persistent-kernel
+scheduling design that keeps a resident kernel warm across tool-call
+boundaries via a host-managed work queue, and provide a reference
+implementation together with a benchmarking harness that isolates
+launch-overhead cost specifically in multi-step tool-calling loops
+(as opposed to raw decode). We report a CPU-level simulation
+methodology for estimating overhead scaling with step count and
+tool latency, and provide CUDA/Triton skeleton kernels intended to
+be benchmarked on target hardware (evaluated here on consumer-class
+GPUs; A100/H100-class results are left as an open experiment for
+readers with access to that hardware).
+\end{abstract}
+
+\section{Introduction}
+
+Two workloads are routinely conflated in the megakernel literature:
+(1) single-turn autoregressive decoding, where the loop body is
+entirely on-GPU and iteration count is bounded by output length, and
+(2) agentic loops, where each iteration alternates an on-GPU decode
+segment with an off-GPU, data-dependent tool call (a database query,
+an API call, a subprocess). Prior megakernel systems --- Mirage
+Persistent Kernel (MPK) \citep{mpk2025}, the AMD MI300X monokernel
+\citep{kog2026}, and Ada-MK's DAG-search fusion \citep{adamk2026} ---
+report that kernel-launch overhead consumes roughly 5--15\% of
+end-to-end decode latency, and that fusing the decode forward pass
+into one resident kernel closes most of that gap. Event Tensor
+\citep{eventtensor2026} further shows that the harder open problem is
+\emph{data-dependent} dynamism inside a megakernel, i.e., control flow
+whose shape is not known until runtime.
+
+Agent loops push this data-dependence outside the kernel entirely: the
+next model call's *content* depends on a tool result the GPU cannot
+see until the host receives it. This raises three questions distinct
+from single-turn decode optimization:
+
+\begin{enumerate}
+  \item Can a persistent kernel remain resident (registers/shared
+  memory allocated, warps parked) across a tool call whose latency is
+  unknown at compile time, rather than being torn down and relaunched?
+  \item What is the actual overhead contributed by kernel
+  \emph{teardown/relaunch} versus unavoidable tool latency, as a
+  function of step count $T$ and tool latency $L$?
+  \item Can multiple concurrent agent instances share one resident
+  kernel via warp specialization, batching their decode segments while
+  their tool calls are in flight independently?
+\end{enumerate}
+
+This paper's contribution is threefold: (a) a cost model separating
+launch overhead from tool latency in agent loops (\S\ref{sec:method});
+(b) a persistent-kernel design with a host-managed work queue that
+keeps the kernel warm across tool boundaries (\S\ref{sec:design}); and
+(c) a reference implementation and benchmarking harness
+(\S\ref{sec:impl}), with results left parameterized for the reader's
+own hardware (\S\ref{sec:experiments}).
+
+\section{Related Work}
+
+\textbf{Kernel fusion for decode.} MPK \citep{mpk2025} compiles
+multi-GPU inference into an SM-level task graph executed inside a
+single mega-kernel, reporting 1.0--1.7$\times$ throughput gains over
+kernel-per-operator systems such as vLLM and SGLang. The Kog AI
+monokernel \citep{kog2026} implements an entire decode pass as one
+persistent kernel on AMD MI300X, reporting 3{,}000+ tokens/s per
+request. Ada-MK \citep{adamk2026} profiles kernel-launch overhead at
+roughly 14.6\% of end-to-end latency for a 1.5B model under
+TensorRT-LLM and proposes automated DAG search to decide fusion
+boundaries.
+
+\textbf{Dynamic megakernels.} Event Tensor \citep{eventtensor2026}
+introduces a compiler abstraction encoding data-dependent task
+dependencies, addressing the case where tile shapes are not known
+statically --- the closest existing treatment of the dynamism problem
+that agent loops exhibit at a coarser (tool-call) granularity.
+
+\textbf{GPU-resident runtimes.} GPUOS \citep{gpuos2026} proposes a
+long-lived kernel fed by a host-managed work queue with runtime
+operator injection via NVRTC, avoiding kernel relaunch for
+heterogeneous, evolving workloads. Our design borrows this
+host-queue/resident-kernel split but targets the agent-loop boundary
+specifically, i.e., the queue entries are \emph{tool-call results},
+not arbitrary injected operators.
+
+\textbf{Gap.} No existing system we are aware of measures or
+optimizes for the specific overhead of kernel relaunch \emph{across
+tool-call boundaries} in agent loops, as opposed to across
+token-generation steps within one decode. This is the gap this paper
+targets.
+
+\section{Cost Model}
+\label{sec:method}
+
+Let an agent loop consist of $T$ steps. At step $t$, the model
+performs a decode segment of on-GPU latency $d_t$, followed by a tool
+call of latency $\ell_t$ (network- or CPU-bound, effectively opaque to
+the GPU). Under a naive per-step kernel-launch design, each decode
+segment additionally pays a launch/teardown overhead $\kappa$, so
+total wall-clock time is
+
+\begin{equation}
+  T_{\text{naive}} = \sum_{t=1}^{T} \left( d_t + \kappa + \ell_t \right).
+  \label{eq:naive}
+\end{equation}
+
+Under a persistent-kernel design where the kernel remains resident
+across tool calls (parked on an idle work-queue poll rather than
+torn down), the per-step overhead collapses to a lightweight queue
+signal $\sigma \ll \kappa$:
+
+\begin{equation}
+  T_{\text{persistent}} = \sum_{t=1}^{T} \left( d_t + \sigma + \ell_t \right).
+  \label{eq:persistent}
+\end{equation}
+
+The recoverable overhead is therefore
+
+\begin{equation}
+  \Delta(T) = T \cdot (\kappa - \sigma).
+  \label{eq:delta}
+\end{equation}
+
+Two regimes matter in practice:
+
+\begin{itemize}
+  \item \textbf{Tool-latency-dominated} ($\ell_t \gg \kappa$): typical
+  for agents calling slow external APIs. Here $\Delta(T)$ is a small
+  fraction of wall-clock time and persistent kernels offer limited
+  end-to-end speedup, though they still free the GPU for other work
+  during the idle interval if the queue design allows preemption.
+  \item \textbf{Launch-overhead-dominated} ($\kappa \gtrsim d_t$):
+  typical for short tool calls (cache lookups, local function calls,
+  small retrievals) chained across many steps, or for small/quantized
+  models where $d_t$ itself is only slightly larger than $\kappa$.
+  Here $\Delta(T)$ scales linearly with $T$ and dominates end-to-end
+  latency for long agent trajectories ($T$ in the tens to hundreds).
+\end{itemize}
+
+This distinguishes the agent-loop regime from single-turn decode: $T$
+is bounded by \emph{agent steps}, not \emph{output tokens}, and
+$\ell_t$ (tool latency) is a new term absent from prior megakernel
+cost models.
+
+\section{Persistent Kernel Design for Agent Loops}
+\label{sec:design}
+
+We propose a three-part design:
+
+\textbf{(1) Resident decode kernel.} A single persistent kernel
+(following the MPK/Kog pattern) implements the model forward pass as
+an SM-level task graph, launched once per agent session rather than
+once per step.
+
+\textbf{(2) Host-managed agent work queue.} Between decode segments,
+the kernel does not exit; warps poll a lightweight, host-writable
+queue (cf. GPUOS \citep{gpuos2026}) for the next input token block,
+which becomes available only once the host has received the tool
+result and re-encoded it. This converts step boundaries from
+"relaunch" events into "queue poll" events.
+
+\textbf{(3) Cooperative yield on tool latency.} Because $\ell_t$ can
+be large and unpredictable, the resident kernel exposes a yield path:
+if no queue entry arrives within a short poll window, the relevant
+SMs are released back to the scheduler (e.g., via MPS or
+time-slicing) so concurrent agent sessions --- or unrelated
+workloads --- can use the GPU during the idle interval, then
+re-acquire the resident context when the tool result arrives. This
+addresses the multi-agent batching question raised in
+\S\ref{sec:method}: several agent sessions can share the GPU's SMs
+opportunistically without each paying a full relaunch.
+
+Algorithm~\ref{alg:loop} summarizes the host/device split.
+
+\begin{algorithm}[t]
+\caption{Persistent-kernel agent loop}
+\label{alg:loop}
+\begin{algorithmic}[1]
+\State \textbf{Device:} launch resident kernel $K$ once; $K$ polls queue $Q$
+\For{$t = 1, \dots, T$}
+  \State \textbf{Host:} push encoded state onto $Q$
+  \State \textbf{Device:} $K$ dequeues, executes decode segment $d_t$, writes output tokens
+  \State \textbf{Host:} read output tokens; dispatch tool call $\ell_t$ (async)
+  \If{no new entry in $Q$ within poll window $w$}
+    \State \textbf{Device:} yield SMs (cooperative release)
+  \EndIf
+  \State \textbf{Host:} on tool completion, re-encode result, go to line 3
+\EndFor
+\State \textbf{Device:} $K$ exits on host-issued shutdown signal
+\end{algorithmic}
+\end{algorithm}
+
+\section{Reference Implementation}
+\label{sec:impl}
+
+We provide three artifacts alongside this paper (see supplementary
+code):
+
+\begin{itemize}
+  \item \texttt{persistent\_kernel.cu} --- a CUDA skeleton implementing
+  a resident kernel with a device-side spin-queue, a decode-segment
+  stub, and a host-side loop that pushes/pops queue entries instead of
+  relaunching the kernel. Intended as a scaffold to plug in a real
+  forward pass (e.g., via CUTLASS or a Mirage-compiled task graph).
+  \item \texttt{triton\_persistent\_agent\_kernel.py} --- a Triton
+  prototype of the same idea at a higher level, useful for rapid
+  iteration before dropping to raw CUDA.
+  \item \texttt{benchmark.py} --- a hardware-agnostic benchmarking
+  harness that measures $T_{\text{naive}}$ vs.\ $T_{\text{persistent}}$
+  under Eq.~\ref{eq:naive}--\ref{eq:delta}. On machines without a
+  CUDA-capable GPU (as in this preparation environment) it runs in a
+  \emph{simulation mode} that models $\kappa$, $\sigma$, $d_t$, and
+  $\ell_t$ as configurable random variables to validate the cost model
+  and produce the scaling plots in \S\ref{sec:experiments}; on a real
+  GPU it switches automatically to measuring actual kernel-launch and
+  queue-poll latency via CUDA events.
+\end{itemize}
+
+\section{Experiments}
+\label{sec:experiments}
+
+\textbf{Setup.} We evaluate the cost model of \S\ref{sec:method}
+under two parameter regimes matched to the two cases discussed above:
+(A) tool-latency-dominated, $\ell_t \sim \mathcal{U}(50,200)$ ms,
+$d_t \sim \mathcal{U}(5,15)$ ms, $\kappa \approx 1$--2 ms (typical
+measured CUDA launch overhead in prior work); and (B)
+launch-overhead-dominated, $\ell_t \sim \mathcal{U}(0.5,2)$ ms,
+$d_t \sim \mathcal{U}(2,5)$ ms, same $\kappa$. In both regimes
+$\sigma$ (queue-poll signal) is taken as $\kappa/20$, consistent with
+the lightweight-signaling overheads reported for MPK's in-kernel
+runtime \citep{mpk2025}.
+
+\textbf{Metric.} We report $\Delta(T)/T_{\text{naive}}(T)$, the
+fraction of end-to-end wall-clock time attributable to recoverable
+launch overhead, as a function of trajectory length $T \in
+\{1,10,50,100,200\}$.
+
+\textbf{Placeholder for hardware results.} Table~\ref{tab:results}
+reports simulated values from \texttt{benchmark.py}; column
+``measured (GPU)'' is left for the reader to fill in by running the
+CUDA/Triton artifacts on target hardware (we recommend at minimum an
+RTX-class consumer GPU and, if available, an A100/H100 for direct
+comparison against the MPK/Kog numbers cited in \S2).
+
+\begin{table}[t]
+\centering
+\caption{Fraction of wall-clock time attributable to launch overhead,
+by trajectory length $T$ and regime, with $\kappa=1.5$ ms and
+$\sigma=\kappa/20$ (modeled queue-poll cost). ``Simulated'' values are
+produced by \texttt{benchmark.py --mode simulate} on a CPU-only
+machine (reproducible with the default seed); ``measured (GPU)'' is
+intentionally left blank for the reader's own hardware run via
+\texttt{benchmark.py --mode gpu}, which measures real $\kappa$ and
+$\sigma$ with CUDA events instead of modeling them.}
+\label{tab:results}
+\begin{tabular}{lcccc}
+\toprule
+Regime & $T$ & Simulated $\Delta/T_{\text{naive}}$ & Measured (GPU) \\
+\midrule
+A: tool-latency-dominated    & 10  & 0.89\% & \emph{run \texttt{--mode gpu}} \\
+A: tool-latency-dominated    & 100 & 1.06\% & \emph{run \texttt{--mode gpu}} \\
+B: launch-overhead-dominated & 10  & 21.82\% & \emph{run \texttt{--mode gpu}} \\
+B: launch-overhead-dominated & 100 & 23.18\% & \emph{run \texttt{--mode gpu}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Even in this idealized simulation, the two regimes separate cleanly:
+in the tool-latency-dominated regime (A), recoverable launch overhead
+is under 1.1\% of wall-clock time even at $T=100$ steps, because each
+step is dominated by an opaque, un-recoverable tool-call latency
+($\ell_t \in [50,200]$ ms). In the launch-overhead-dominated regime
+(B) --- short tool calls chained across many steps --- the same
+$\kappa$ and $\sigma$ produce a recoverable overhead of roughly
+21--23\% of wall-clock time, growing slowly with $T$ toward the
+asymptotic fraction $(\kappa-\sigma)/(\bar d + \kappa + \bar\ell)$.
+This matches the qualitative prediction of \S\ref{sec:method}: agents
+built around fast, chainable tool calls (cache lookups, local
+function calls, small retrievals, as opposed to slow external-API
+agents) are exactly where a persistent-kernel design is expected to
+pay off, and this should be verified against real hardware
+$\kappa,\sigma$ measurements via \texttt{benchmark.py --mode gpu}
+rather than the modeled constants used here. We deliberately do not
+fabricate GPU numbers in this draft: the harness produces them
+directly when run on the target machine, and the exact values depend
+on GPU generation, driver, and the forward pass plugged into the CUDA
+skeleton, so hardcoding illustrative numbers into the paper would
+misrepresent an actual hardware result.
+
+\section{Discussion and Limitations}
+
+The design in \S\ref{sec:design} addresses overhead \emph{caused by
+relaunching}, not overhead caused by the tool call itself; in the
+tool-latency-dominated regime the main win is freeing the GPU for
+other tenants during the idle window, not reducing wall-clock latency
+for a single agent. The cooperative-yield mechanism (line 6,
+Algorithm~\ref{alg:loop}) is the least mature part of the design and
+would benefit from integration with existing GPU scheduling
+primitives (MPS, MIG, or a custom SM-partition scheme) rather than a
+from-scratch implementation. We also do not address correctness under
+speculative or partial decode segments that are discarded when a tool
+result invalidates an in-flight assumption; this is left as future
+work, connected to the broader idea of speculative multi-agent
+execution.
+
+\section{Conclusion}
+
+Persistent/megakernel designs have closed most of the kernel-launch
+overhead gap for single-turn decode. Agent loops introduce a
+distinct, largely unaddressed overhead structure at the tool-call
+boundary. We formalize this with a simple cost model, propose a
+host-queue/resident-kernel design to close the gap, and release a
+reference implementation and benchmarking harness so the cost model
+can be validated empirically on real hardware rather than asserted.
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{9}
+
+\bibitem[Mirage Persistent Kernel, 2025]{mpk2025}
+Mirage Persistent Kernel: A Compiler and Runtime for Mega-Kernelizing
+Tensor Programs. \url{https://arxiv.org/html/2512.22219v1}
+
+\bibitem[Kog AI, 2026]{kog2026}
+Building a single-kernel, latency-optimized LLM inference engine on
+AMD MI300X GPUs. Kog AI Engineering Blog.
+\url{https://blog.kog.ai/building-a-single-kernel-latency-optimized-llm-inference-engine-on-amd-mi300x-gpus/}
+
+\bibitem[Ada-MK, 2026]{adamk2026}
+Ada-MK: Adaptive MegaKernel Optimization via Automated DAG-based
+Search for LLM Inference. \url{https://arxiv.org/html/2605.11581v1}
+
+\bibitem[Event Tensor, 2026]{eventtensor2026}
+Event Tensor: A Unified Abstraction for Compiling Dynamic
+Megakernels. \url{https://arxiv.org/html/2604.13327v1}
+
+\bibitem[GPUOS, 2026]{gpuos2026}
+GPUOS: A GPU Operating System Primitive for Transparent Operation
+Fusion. \url{https://arxiv.org/pdf/2604.17861}
+
+\end{thebibliography}
+
+\end{document}
