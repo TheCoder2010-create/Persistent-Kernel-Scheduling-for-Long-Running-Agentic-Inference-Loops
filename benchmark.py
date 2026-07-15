@@ -70,76 +70,109 @@ def simulate(regime_key: str, seed: int = 0):
     return dict(regime=regime_key, label=r["label"], kappa_ms=kappa, sigma_ms=sigma, results=results)
 
 
-def measure_kappa_gpu(n_launches: int = 2000):
-    """Measure actual CUDA kernel-launch overhead via a trivial kernel,
-    timed with CUDA events. Requires torch + a CUDA device."""
+def _run_op_chain(x: "torch.Tensor", n_ops: int) -> None:
+    """Execute a chain of n_ops sequential small kernel launches on x.
+
+    Alternates add / mul / relu to mimic the heterogeneous mix of
+    element-wise ops that appear across attention + MLP + norm passes
+    in a transformer layer.  Each call dispatches a distinct CUDA
+    kernel, so n_ops launches hit the driver per simulated agent step.
+    """
+    for i in range(n_ops):
+        op = i % 3
+        if op == 0:
+            x.add_(0.01)
+        elif op == 1:
+            x.mul_(1.001)
+        else:
+            x.relu_()
+
+
+def measure_kappa_gpu(n_steps: int = 2000, n_ops: int = 48):
+    """Measure per-step kernel-launch overhead for a chain of n_ops kernels.
+
+    Each 'step' dispatches n_ops sequential small kernels (add / mul /
+    relu, alternating) — approximating the op count of a few transformer
+    layers (attention + MLP + norms).  kappa is the average wall-time of
+    one full chain, measured with CUDA events.
+
+    Requires torch + a CUDA device.
+    """
     import torch
 
     if not torch.cuda.is_available():
         raise SystemExit("No CUDA GPU detected; use --mode simulate instead.")
 
     device = torch.device("cuda")
-    x = torch.zeros(1, device=device)
+    # Small tensor: overhead, not compute, is what we want to measure.
+    x = torch.ones(256, device=device)
 
-    # Warmup
-    for _ in range(50):
-        x.add_(1.0)
+    # Warmup: a few full chains so driver/JIT is hot.
+    for _ in range(20):
+        _run_op_chain(x, n_ops)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
     start.record()
-    for _ in range(n_launches):
-        x.add_(1.0)  # each call dispatches a fresh kernel launch
+    for _ in range(n_steps):
+        _run_op_chain(x, n_ops)  # n_ops fresh kernel launches per step
     end.record()
     torch.cuda.synchronize()
 
     total_ms = start.elapsed_time(end)
-    kappa_ms = total_ms / n_launches
+    kappa_ms = total_ms / n_steps   # average cost of one n_ops chain
     return kappa_ms
 
 
-def measure_sigma_gpu(n_polls: int = 2000):
-    """
-    Approximates sigma (queue-poll signal cost) as the cost of a
-    CUDA-graph replay of the same trivial op, which is the practical
-    stand-in for kernel residency available without hand-written CUDA
-    (see triton_persistent_agent_kernel.py). True device-side queue
-    polling (persistent_kernel.cu) will typically be even cheaper than
-    this upper bound.
+def measure_sigma_gpu(n_steps: int = 2000, n_ops: int = 48):
+    """Approximate sigma as the cost of replaying a CUDA graph of the
+    full n_ops chain.
+
+    The whole chain (n_ops kernels) is captured as ONE CUDA graph and
+    replayed once per step — eliminating per-launch Python/driver
+    dispatch overhead while keeping the same compute.  This is the
+    framework-level stand-in for device-side queue signalling cost
+    (see triton_persistent_agent_kernel.py and paper.tex Sec 4).
+    True device-side polling (persistent_kernel.cu) is typically even
+    cheaper than this upper bound.
     """
     import torch
 
     device = torch.device("cuda")
-    x = torch.zeros(1, device=device)
+    x = torch.ones(256, device=device)
 
-    for _ in range(50):
-        x.add_(1.0)
+    # Warmup before graph capture.
+    for _ in range(20):
+        _run_op_chain(x, n_ops)
     torch.cuda.synchronize()
 
+    # Capture the entire n_ops chain as a single CUDA graph.
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        x.add_(1.0)
+        _run_op_chain(x, n_ops)
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
     start.record()
-    for _ in range(n_polls):
-        g.replay()
+    for _ in range(n_steps):
+        g.replay()  # one graph replay = one agent step, no fresh launches
     end.record()
     torch.cuda.synchronize()
 
     total_ms = start.elapsed_time(end)
-    sigma_ms = total_ms / n_polls
+    sigma_ms = total_ms / n_steps
     return sigma_ms
 
 
-def run_gpu(regime_key: str):
+def run_gpu(regime_key: str, n_ops: int = 48):
     r = REGIMES[regime_key]
-    kappa = measure_kappa_gpu()
-    sigma = measure_sigma_gpu()
+    print(f"  measuring kappa (n_ops={n_ops}, naive launches)...")
+    kappa = measure_kappa_gpu(n_ops=n_ops)
+    print(f"  measuring sigma (n_ops={n_ops}, CUDA graph replay)...")
+    sigma = measure_sigma_gpu(n_ops=n_ops)
 
     results = []
     random.seed(0)
@@ -162,12 +195,16 @@ def run_gpu(regime_key: str):
 
     return dict(regime=regime_key, label=r["label"],
                 kappa_ms=round(kappa, 5), sigma_ms=round(sigma, 5),
+                n_ops_per_step=n_ops,
                 results=results)
 
 
 def print_table(payload):
+    n_ops_str = (f"  ops_per_step={payload['n_ops_per_step']}"
+                 if "n_ops_per_step" in payload else "")
     print(f"\nRegime {payload['regime']} ({payload['label']})  "
-          f"kappa={payload['kappa_ms']:.4f} ms  sigma={payload['sigma_ms']:.4f} ms")
+          f"kappa={payload['kappa_ms']:.4f} ms  sigma={payload['sigma_ms']:.4f} ms"
+          f"{n_ops_str}")
     print(f"{'T':>5} {'T_naive(ms)':>14} {'T_persist(ms)':>16} "
           f"{'Delta(ms)':>12} {'Delta/T_naive':>15}")
     for row in payload["results"]:
@@ -181,6 +218,10 @@ if __name__ == "__main__":
     parser.add_argument("--regime", choices=["A", "B", "both"], default="both")
     parser.add_argument("--json-out", type=str, default=None,
                          help="optional path to write results as JSON")
+    parser.add_argument("--ops-per-step", type=int, default=48,
+                         help="number of sequential kernel launches per simulated "
+                              "agent step (gpu mode only); default 48, representing "
+                              "~attention+MLP+norm ops across a few transformer layers")
     args = parser.parse_args()
 
     regimes = ["A", "B"] if args.regime == "both" else [args.regime]
@@ -190,7 +231,7 @@ if __name__ == "__main__":
         if args.mode == "simulate":
             payload = simulate(reg)
         else:
-            payload = run_gpu(reg)
+            payload = run_gpu(reg, n_ops=args.ops_per_step)
         print_table(payload)
         all_payloads.append(payload)
 
