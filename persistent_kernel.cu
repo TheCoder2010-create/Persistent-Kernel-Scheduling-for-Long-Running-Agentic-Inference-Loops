@@ -507,7 +507,13 @@ __global__ void persistent_agent_kernel(
 
     __shared__ int s_state;
     __shared__ unsigned long long s_t_ready;
-    __shared__ DecodeWorkspace ws;
+#ifdef LARGE_MODEL
+    extern __shared__ char ws_raw[];
+    DecodeWorkspace* ws = (DecodeWorkspace*)ws_raw;
+#else
+    __shared__ DecodeWorkspace ws_static;
+    DecodeWorkspace* ws = &ws_static;
+#endif
 
     if (threadIdx.x == 0)
         printf("persistent_kernel started, queue=%p\n", (void*)queue);
@@ -550,7 +556,7 @@ __global__ void persistent_agent_kernel(
             k_cache,
             v_cache,
             kv_len,
-            &ws
+            ws
         );
 
         unsigned long long t_compute_end = clock64();
@@ -578,8 +584,14 @@ __global__ void transformer_step_kernel(
     const float* input, float* output, float* weights,
     float* k_cache, float* v_cache, int* kv_len
 ) {
-    __shared__ DecodeWorkspace ws;
-    decode_segment(input, output, weights, k_cache, v_cache, kv_len, &ws);
+#ifdef LARGE_MODEL
+    extern __shared__ char ws_raw[];
+    DecodeWorkspace* ws = (DecodeWorkspace*)ws_raw;
+#else
+    __shared__ DecodeWorkspace ws_static;
+    DecodeWorkspace* ws = &ws_static;
+#endif
+    decode_segment(input, output, weights, k_cache, v_cache, kv_len, ws);
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +662,23 @@ int main(int argc, char** argv) {
     printf("  DecodeWorkspace shared mem: %zu bytes\n", sizeof(DecodeWorkspace));
     printf("\n");
 
+#ifdef LARGE_MODEL
+    int shared_mem_size = (int)sizeof(DecodeWorkspace);
+    CUDA_CHECK(cudaFuncSetAttribute(
+        (const void*)persistent_agent_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shared_mem_size
+    ));
+    CUDA_CHECK(cudaFuncSetAttribute(
+        (const void*)transformer_step_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shared_mem_size
+    ));
+    size_t shmem_size = sizeof(DecodeWorkspace);
+#else
+    size_t shmem_size = 0;
+#endif
+
     int weights_floats = N_LAYERS * LAYER_FLOATS;
     int kv_floats_total = N_LAYERS * N_HEADS * MAX_SEQ_LEN * HEAD_DIM;
 
@@ -716,7 +745,7 @@ int main(int argc, char** argv) {
 
         cudaStream_t persistent_stream;
         CUDA_CHECK(cudaStreamCreateWithFlags(&persistent_stream, cudaStreamNonBlocking));
-        persistent_agent_kernel<<<1, 256, 0, persistent_stream>>>(
+        persistent_agent_kernel<<<1, 256, shmem_size, persistent_stream>>>(
             d_weights, d_k_cache, d_v_cache, d_kv_len, d_queue, d_stats);
         CUDA_CHECK(cudaGetLastError());
 
@@ -817,7 +846,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < DIM; i++) h_input[i] = 0.01f;
         CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), DIM * sizeof(float),
                    cudaMemcpyHostToDevice));
-        transformer_step_kernel<<<1, 256>>>(
+        transformer_step_kernel<<<1, 256, shmem_size>>>(
             d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -831,7 +860,7 @@ int main(int argc, char** argv) {
                 h_input[i] = 0.01f * (float)((t * DIM + i) % 100);
             CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), DIM * sizeof(float),
                        cudaMemcpyHostToDevice));
-            transformer_step_kernel<<<1, 256>>>(
+            transformer_step_kernel<<<1, 256, shmem_size>>>(
                 d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len);
             CUDA_CHECK(cudaGetLastError());
         }
@@ -850,7 +879,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaEventCreate(&ke_end));
         CUDA_CHECK(cudaEventRecord(ke_start, 0));
         for (int t = 0; t < N_steps; t++) {
-            transformer_step_kernel<<<1, 256>>>(
+            transformer_step_kernel<<<1, 256, shmem_size>>>(
                 d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len);
             CUDA_CHECK(cudaGetLastError());
         }
