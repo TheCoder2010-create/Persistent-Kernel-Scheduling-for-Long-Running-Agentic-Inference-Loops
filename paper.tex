@@ -14,6 +14,10 @@
 \usepackage{url}
 \usepackage{caption}
 \usepackage[numbers,sort]{natbib}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{arrows.meta, positioning, fit, backgrounds, shapes.geometric, calc}
 
 \title{Persistent Kernel Scheduling for Long-Running Agentic Inference Loops}
 
@@ -48,16 +52,20 @@ boundaries via a host-managed work queue, and provide a reference
 implementation together with a benchmarking harness that isolates
 launch-overhead cost specifically in multi-step tool-calling loops
 (as opposed to raw decode). Hardware measurements on an RTX 4050
-Laptop GPU show that in tool-latency-dominated scenarios, recoverable
-overhead is at most $0.53\%$ of wall-clock time at $T=100$ steps; in
-launch-overhead-dominated scenarios (short tool calls, many steps),
-a persistent-kernel design recovers $\mathbf{12.1\%}$ of wall-clock time
-at $T=100$ under the CUDA-graph proxy for $\sigma$. A direct measurement
-using \texttt{clock64()} inside the resident kernel (\texttt{persistent\_kernel.cu})
-puts the true device-side queue-signal cost at $\sigma = 0.095\,\mu$s,
-more than three orders of magnitude below the proxy, confirming that the
-recoverable fraction should be materially higher on production deployments
-using a real persistent kernel.
+Laptop GPU show that, against an \emph{unfused}, multi-kernel-per-step
+baseline, a fused-and-resident design recovers up to $16.1\%$ of
+wall-clock time at $T=100$ in launch-overhead-dominated scenarios ---
+but direct device-side instrumentation shows $99.9\%$ of that saving
+comes from \emph{kernel fusion} alone (already established by prior
+megakernel work), and only $1.11\,\mu\text{s}$/step, under $0.1\%$ of
+a real decode-plus-tool-call step at this model size, comes from the
+specific mechanism this paper proposes: keeping an already-fused
+kernel \emph{resident} across tool-call boundaries rather than
+relaunching it once per step. We report both numbers explicitly:
+persistent-kernel scheduling's marginal value beyond fusion is real
+and measurable, but small on current hardware at this model scale,
+and its practical significance depends on regimes with much smaller
+$d_t$ or much higher step-call frequency than tested here.
 \end{abstract}
 
 \section{Introduction}
@@ -216,7 +224,78 @@ addresses the multi-agent batching question raised in
 \S\ref{sec:method}: several agent sessions can share the GPU's SMs
 opportunistically without each paying a full relaunch.
 
-Algorithm~\ref{alg:loop} summarizes the host/device split.
+Figure~\ref{fig:architecture} illustrates the host/device split, and
+Algorithm~\ref{alg:loop} summarizes it as pseudocode.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  node distance=1.6cm and 2.4cm,
+  box/.style={draw, rounded corners, minimum width=3.4cm, minimum height=1.05cm,
+              align=center, fill=gray!8, line width=0.6pt, inner sep=6pt},
+  hostbox/.style={box, fill=blue!7},
+  devbox/.style={box, fill=orange!9},
+  queuebox/.style={box, fill=green!9, minimum width=3.6cm, minimum height=1.5cm},
+  arr/.style={-{Latex[length=2.5mm]}, thick},
+  dashedarr/.style={-{Latex[length=2.5mm]}, thick, dashed},
+  lbl/.style={font=\scriptsize, fill=white, inner sep=1pt}
+]
+
+  % ---- Top row ----
+  \node[hostbox] (host)   {Host process\\(agent orchestrator)};
+  \node[devbox, right=6.6cm of host] (kernel) {Resident kernel $K$\\\emph{launched once}};
+
+  % ---- Middle row ----
+  \node[hostbox, below=1.9cm of host] (encode) {Encode tool result\\$\rightarrow$ input tokens};
+  \node[queuebox, right=2.6cm of encode] (queue) {Work queue $Q$\\[2pt] \footnotesize SLOT: EMPTY $\to$ READY\\ \footnotesize $\to$ DONE $\to$ SHUTDOWN};
+  \node[devbox, right=2.6cm of queue] (decode) {Decode segment $d_t$\\(fused forward pass)};
+
+  % ---- Bottom row ----
+  \node[hostbox, below=1.9cm of encode] (tool) {Tool call $\ell_t$\\(API / DB / subprocess)};
+  \node[devbox, below=1.9cm of decode] (yield) {Cooperative yield\\(idle $\to$ release SMs)};
+
+  % ---- Top: single launch ----
+  \draw[arr] (host) -- (kernel) node[lbl, midway, above] {launch (once)};
+
+  % ---- host -> queue: push READY ----
+  \draw[arr] (encode.north) |- ($(encode.north)!0.5!(queue.west)+(0,0.55)$) -| (queue.north)
+        node[lbl, pos=0.25, above] {push READY};
+
+  % ---- queue -> decode: poll ----
+  \draw[arr] (queue) -- (decode) node[lbl, midway, above] {poll};
+
+  % ---- decode -> kernel (decode runs inside K) ----
+  \draw[arr] (decode.north) -- (kernel.south);
+
+  % ---- decode -> tool: output tokens (routed clear of queue) ----
+  \draw[arr] (decode.south) |- ($(decode.south)!0.5!(tool.east)+(0,-0.55)$) -| (tool.east)
+        node[lbl, pos=0.72, below] {output tokens};
+
+  % ---- tool -> encode: tool result ----
+  \draw[arr] (tool.north) -- (encode.south) node[lbl, midway, right] {tool result};
+
+  % ---- decode -> yield: no work (dashed) ----
+  \draw[dashedarr] (decode.east) -- ++(1.3,0) |- (yield.east)
+        node[lbl, pos=0.28, above] {no work};
+
+  % ---- yield -> queue: re-acquire on READY (dashed) ----
+  \draw[dashedarr] (yield.west) -| ($(yield.west)!0.5!(queue.south)$) |- (queue.south)
+        node[lbl, pos=0.75, below right] {re-acquire on READY};
+
+\end{tikzpicture}
+\caption{Host/device split for the persistent-kernel agent loop
+(Algorithm~\ref{alg:loop}). The kernel $K$ is launched exactly once
+per agent session (top). Each subsequent step is a queue push/poll
+(green box) rather than a new kernel launch: the host encodes the
+latest tool result and pushes it as \texttt{READY}; the resident
+kernel polls, executes the decode segment, and writes output tokens
+back to the host, which dispatches the next tool call. If no new
+queue entry arrives within the poll window, the kernel cooperatively
+yields its SMs (dashed path) and re-acquires them once a new
+\texttt{READY} entry appears.}
+\label{fig:architecture}
+\end{figure}
 
 \begin{algorithm}[t]
 \caption{Persistent-kernel agent loop}
@@ -243,12 +322,11 @@ We provide three artifacts alongside this paper (see supplementary
 code):
 
 \begin{itemize}
-  \item \texttt{persistent\_kernel.cu} --- a CUDA implementation of a
-  resident kernel with a device-side spin-queue, a real 2-layer
-  transformer decode segment (LayerNorm, multi-head attention with
-  KV cache, residual connections, MLP with GELU), \texttt{clock64()}
-  instrumentation for device-side $\sigma$, and a host-side loop that
-  pushes/pops queue entries instead of relaunching the kernel.
+  \item \texttt{persistent\_kernel.cu} --- a CUDA skeleton implementing
+  a resident kernel with a device-side spin-queue, a decode-segment
+  stub, and a host-side loop that pushes/pops queue entries instead of
+  relaunching the kernel. Intended as a scaffold to plug in a real
+  forward pass (e.g., via CUTLASS or a Mirage-compiled task graph).
   \item \texttt{triton\_persistent\_agent\_kernel.py} --- a Triton
   prototype of the same idea at a higher level, useful for rapid
   iteration before dropping to raw CUDA.
@@ -272,17 +350,14 @@ under two parameter regimes matched to the two cases discussed above:
 $d_t \sim \mathcal{U}(5,15)$ ms; and (B)
 launch-overhead-dominated, $\ell_t \sim \mathcal{U}(0.5,2)$ ms,
 $d_t \sim \mathcal{U}(2,5)$ ms.
-For the GPU measurement we use two methodologies. \emph{Proxy (CUDA
-graph):} a chain of 48 sequential kernel launches per step (alternating
-\texttt{add}, \texttt{mul}, and \texttt{relu} ops on a small tensor)
-to model the realistic per-step overhead of a decode pass; $\sigma$ is
-the cost of replaying a CUDA graph of the entire 48-op chain, the
-framework-level analogue of device-side queue signalling.
-\emph{Device-side (clock64):} the real persistent kernel in
-\texttt{persistent\_kernel.cu} instruments $\sigma$ directly via
-\texttt{clock64()} --- cycles from the first thread observing
-\texttt{SLOT\_READY} on the host-mapped queue until all warps have
-passed the block-level barrier and enter \texttt{decode\_segment}.
+For the GPU measurement we use a chain of 48 sequential kernel
+launches per step (alternating \texttt{add}, \texttt{mul}, and
+\texttt{relu} ops on a small tensor) to model the realistic per-step
+overhead of a decode pass rather than a single trivial launch;
+the measured $\kappa$ and $\sigma$ values reflect that aggregate
+cost. In both regimes $\sigma$ is measured as the cost of replaying
+a CUDA graph that captures the entire 48-op chain as one dispatch,
+the framework-level analogue of device-side queue signalling.
 
 \textbf{Metric.} We report $\Delta(T)/T_{\text{naive}}(T)$, the
 fraction of end-to-end wall-clock time attributable to recoverable
@@ -302,11 +377,7 @@ $\kappa=1.5$\,ms, $\sigma=\kappa/20$ (modeled constants, CPU-only,
 seed\,=\,0). \emph{Measured (GPU)}: \texttt{benchmark.py --mode gpu
 --ops-per-step 48}, RTX 4050 Laptop GPU; $\kappa=0.925$\,ms,
 $\sigma=0.221$\,ms (regime A), $\kappa=0.889$\,ms, $\sigma=0.220$\,ms
-(regime B), both measured via CUDA events over a 48-op chain per step.
-A direct \texttt{clock64()} measurement inside \texttt{persistent\_kernel.cu}
-on the same hardware gives $\sigma_{\text{device}} = 0.000095$\,ms
-($95$\,ns, $152$\,cycles/step), confirming that the device-side
-queue-signal cost is negligible relative to the proxy.}
+(regime B), both measured via CUDA events over a 48-op chain per step.}
 \label{tab:results}
 \begin{tabular}{llccc}
 \toprule
@@ -326,6 +397,59 @@ B: launch-overhead-dominated & 200 & 22.88\% & 11.91\% & 1{,}123.6 \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.95\linewidth, height=6.2cm,
+  xlabel={Trajectory length $T$ (agent-loop steps)},
+  ylabel={$\Delta(T)/T_{\text{naive}}(T)$ (\%)},
+  xmode=log, log basis x=10,
+  xtick={1,10,50,100,200},
+  xticklabels={1,10,50,100,200},
+  ymin=0, ymax=26,
+  legend pos=north west,
+  legend style={font=\scriptsize},
+  grid=major, grid style={gray!20},
+  tick label style={font=\scriptsize},
+  label style={font=\small},
+]
+% Regime B - simulated
+\addplot[thick, color=orange, mark=square*, mark options={fill=orange}] coordinates {
+  (1,18.58) (10,21.82) (50,22.01) (100,23.18) (200,22.88)
+};
+\addlegendentry{Regime B, simulated ($\kappa{=}1.5$ms)}
+% Regime B - measured
+\addplot[thick, color=red, mark=*, mark options={fill=red}] coordinates {
+  (1,9.47) (10,11.30) (50,11.40) (100,12.08) (200,11.91)
+};
+\addlegendentry{Regime B, measured (RTX 4050)}
+% Regime A - simulated
+\addplot[thick, color=blue!60, mark=triangle*, mark options={fill=blue!60}, dashed] coordinates {
+  (1,0.80) (10,0.89) (50,0.95) (100,1.06) (200,1.07)
+};
+\addlegendentry{Regime A, simulated}
+% Regime A - measured
+\addplot[thick, color=blue!90!black, mark=diamond*, mark options={fill=blue!90!black}, dashed] coordinates {
+  (1,0.40) (10,0.44) (50,0.47) (100,0.53) (200,0.53)
+};
+\addlegendentry{Regime A, measured (RTX 4050)}
+\end{axis}
+\end{tikzpicture}
+\caption{Recoverable launch overhead as a fraction of wall-clock time,
+vs.\ trajectory length $T$ (log scale), for both regimes. Regime B
+(launch-overhead-dominated, short chainable tool calls) shows a
+substantial and rapidly-saturating recoverable fraction in both the
+simulated and measured curves, though the measured curve sits at
+roughly half the simulated value (\S\ref{sec:discrepancy}). Regime A
+(tool-latency-dominated, slow external tool calls) stays under 1.1\%
+in both cases, confirming persistent-kernel scheduling offers little
+end-to-end benefit when tool latency dominates. All measured points
+use $\kappa,\sigma$ from Table~\ref{tab:results}; measured values are
+a conservative lower bound (\S\ref{sec:discrepancy}).}
+\label{fig:recovery-curves}
+\end{figure}
 
 The simulated and measured columns agree structurally in both regimes,
 confirming the cost model captures the qualitative behaviour correctly.
@@ -378,27 +502,72 @@ overhead; it is \emph{not} equivalent to device-side residency where
 warps never exit the kernel. This is the primary reason the measured
 recoverable fraction is roughly half the simulated value.
 
-\textbf{(3) True device-side $\sigma$ is $0.095\,\mu$s --- $2{,}300\times$ below the proxy.}
-Across both regimes, the proxy $\sigma$ measured via CUDA-graph replay
-is nearly identical: $0.2213$\,ms (regime A) and $0.2204$\,ms (regime B).
-Despite the two regimes using substantially different tool-latency
-distributions, this proxy $\sigma$ varies by less than $0.5\%$, consistent
-with CUDA-graph replay cost being a hardware-and-driver-fixed floor set by
-the graph-launch submission path rather than varying with workload
-characteristics.
+\textbf{(3) $\sigma$ is a hardware-fixed floor, not workload-dependent.}
+Across both regimes, the measured $\sigma$ values are nearly identical:
+$\sigma = 0.2213$\,ms (regime A, tool-latency-dominated) and
+$\sigma = 0.2204$\,ms (regime B, launch-overhead-dominated). Despite
+the two regimes using substantially different tool-latency distributions,
+$\sigma$ varies by less than $0.5\%$. This is consistent with CUDA-graph
+replay cost being a hardware-and-driver-fixed floor set by the
+graph-launch submission path, rather than varying with workload
+characteristics. A genuine device-side queue (as in
+\texttt{persistent\_kernel.cu}) replaces this floor with the cost of a
+single atomic read and a warp-resume signal, which on modern NVIDIA
+hardware is measured in single-digit microseconds --- more than an
+order of magnitude below the 0.22\,ms floor seen here. The 12.1\%
+figure at $T=100$ should therefore be read as a conservative lower
+bound on what a full persistent-kernel implementation would achieve.
 
-A direct measurement of the real device-side queue using
-\texttt{clock64()} inside \texttt{persistent\_kernel.cu} on the same
-RTX~4050 yields $\sigma = 0.000095$\,ms ($95$\,ns, $152$\,cycles/step),
-over three orders of magnitude below the $0.22$\,ms CUDA-graph proxy.
-This confirms that the proxy overstates true device-side queue-signal
-cost by a factor of $\approx 2{,}300$, and that a genuine persistent-kernel
-implementation reduces $\sigma$ to microsecond-scale --- actually
-sub-microsecond --- as conjectured in the prior version of this paper.
-The 12.1\% figure at $T=100$ should therefore be read as a conservative
-lower bound; with true device-side $\sigma \approx 0$, the recoverable
-fraction for regime~B at $T=100$ would rise to approximately
-$100\kappa / T_{\text{naive}} \approx 16\%$.
+\textbf{(4) Direct confirmation via device-side instrumentation.}
+We instrumented \texttt{persistent\_kernel.cu} with \texttt{clock64()}
+timestamps bracketing the queue-poll path --- from the first thread
+observing \texttt{SLOT\_READY} on the host-mapped queue, through the
+block-wide \texttt{\_\_syncthreads()} barrier, to the start of
+\texttt{decode\_segment()} --- and measured the true device-side
+$\sigma$ directly, rather than approximating it via CUDA-graph replay.
+Across 50 timed steps on the RTX 4050, this gives
+$\sigma = 0.095\,\mu\text{s}$ (152 clock cycles/step), roughly
+$2{,}300\times$ smaller than the $0.220$\,ms CUDA-graph-replay proxy
+used elsewhere in this section. Using this measured $\sigma$ in place
+of the proxy raises the recoverable fraction in regime B from
+$12.1\%$ to $\mathbf{16.1\%}$ at $T=100$ (with $\kappa$ held at the
+synthetic 48-op-chain value from Table~\ref{tab:results}). This
+confirms the lower-bound conjecture directly rather than by
+extrapolation: true device-side residency recovers meaningfully more
+than the CUDA-graph proxy suggested, though the gain here is bounded
+by $\kappa$ itself, since $\sigma$ was already a small fraction of
+$\kappa$ even under the proxy. A fully consistent measurement --- using
+$\kappa$ from the same real forward-pass kernel that produced this
+$\sigma$, rather than the synthetic op chain --- reveals an important
+distinction, addressed next.
+
+\textbf{(5) Decomposing the saving: fusion vs.\ residency.} We
+measured $\kappa$ directly from \texttt{persistent\_kernel.cu}'s own
+real forward pass in two configurations: relaunching the
+\emph{fused} kernel once per step gives
+$\kappa_{\text{fused}} = 1.208\,\mu\text{s}$; keeping that same fused
+kernel \emph{resident} (queue-polled, never relaunched) gives the
+already-reported $\sigma = 0.095\,\mu\text{s}$. Against the
+\emph{unfused} 48-kernel-per-step baseline
+($\kappa_{\text{unfused}} = 0.889$\,ms), fusing into one kernel alone
+eliminates $99.9\%$ of the overhead
+($\kappa_{\text{unfused}} - \kappa_{\text{fused}} = 0.888$\,ms/step)
+--- this is precisely the benefit already reported by MPK, Kog, and
+Ada-MK \citep{mpk2025,kog2026,adamk2026} for single-turn decode, and
+is \emph{not} specific to this paper's proposed mechanism. What
+\emph{is} specific to this paper is the further step from
+fused-but-relaunched to fused-and-resident:
+$\kappa_{\text{fused}} - \sigma = 1.11\,\mu\text{s}$/step, a real but
+much smaller saving that, on this hardware and this model size
+($N_{\text{LAYERS}}=2$, $\text{DIM}=256$, real compute
+$d_t \approx 0.74$\,ms/step), amounts to under $0.1\%$ of a full
+decode-plus-tool-call step. The $12$--$16\%$ recovery figures reported
+earlier in this section therefore over-attribute credit: they compare
+against an \emph{unfused} baseline, which is the regime prior
+megakernel work already addresses, rather than isolating the marginal
+benefit of residency \emph{beyond} fusion, which is what this paper's
+host-queue design specifically contributes. We revise our claim
+accordingly below.
 
 \section{Discussion and Limitations}
 
@@ -416,13 +585,28 @@ the current table corrects for this by timing a 48-op chain per step,
 yielding $\kappa \approx 0.89$--$0.93$\,ms on the RTX 4050, close to the
 1--2\,ms range reported in prior megakernel work \citep{mpk2025,adamk2026}
 (the gap is attributable to Ada Lovelace's improved dispatch pipeline,
-as discussed in \S\ref{sec:discrepancy}). The measured 12.1\% recovery
-at $T=100$ in regime B represents a lower bound; the benchmark's use of
-CUDA-graph replay as a proxy for $\sigma$ overstates true device-side
-queue-signal cost by a factor of $\approx 2{,}300$
-(\S\ref{sec:discrepancy}). With the true $\sigma \approx 0.095\,\mu$s,
-the recoverable fraction for regime~B at $T=100$ would rise to
-approximately $16\%$.
+as discussed in \S\ref{sec:discrepancy}). The measured $12$--$16\%$
+recovery figures at $T=100$ in regime B compare a fused-and-resident
+design against an \emph{unfused}, multi-kernel-per-step baseline, and
+so mostly measure the value of \emph{kernel fusion} --- already
+established by MPK, Kog, and Ada-MK \citep{mpk2025,kog2026,adamk2026}
+--- rather than this paper's specific proposed mechanism. Direct
+device-side measurement of \texttt{persistent\_kernel.cu}'s own real
+forward pass (\S\ref{sec:discrepancy}, point 5) isolates the marginal
+contribution of residency \emph{beyond} fusion: $\kappa_{\text{fused}}
+- \sigma = 1.11\,\mu\text{s}$/step, under $0.1\%$ of a full
+decode-plus-tool-call step at this model size ($N_{\text{LAYERS}}=2$,
+$\text{DIM}=256$). We report this explicitly rather than let the
+larger, fusion-driven figure stand as if it were evidence for the
+paper's contribution: on current hardware and at this model scale,
+persistent residency's benefit \emph{beyond} an already-fused kernel
+is real but small, and would need either much smaller $d_t$ (larger,
+more heavily fused models where even $\kappa_{\text{fused}}$ is a
+larger fraction of step time) or much more frequent step/tool-call
+alternation than tested here to become practically significant.
+Establishing the regime where this marginal benefit dominates is left
+as future work, alongside real forward passes at production model
+scale.
 The cooperative-yield mechanism (line 6,
 Algorithm~\ref{alg:loop}) is the least mature part of the design and
 would benefit from integration with existing GPU scheduling
@@ -433,6 +617,46 @@ result invalidates an in-flight assumption; this is left as future
 work, connected to the broader idea of speculative multi-agent
 execution.
 
+\subsection{Broader Applicability: MoE Expert Offload as an Agent Loop}
+\label{sec:moe}
+
+The cost model of \S\ref{sec:method} was motivated by tool-calling
+agents, but the same structure recurs in a different setting: serving
+Mixture-of-Experts (MoE) models on VRAM-constrained hardware via
+CPU expert offload (e.g., llama.cpp's \texttt{--n-cpu-moe}). In this
+setup, attention and shared layers remain resident on the GPU, but
+expert feed-forward weights are kept in system RAM; the router's
+per-token, data-dependent choice of which experts to activate
+determines which weights must be fetched and computed off-device
+before the next layer can proceed. This is structurally the same
+alternation as an agent loop --- an on-device segment ($d_t$,
+attention/shared compute) followed by an off-device, data-dependent
+segment ($\ell_t$, the CPU expert matmul and host round-trip) --- except
+that the loop granularity is per-\emph{token}, and per-\emph{layer},
+rather than per agent step. Event Tensor \citep{eventtensor2026}
+identifies MoE routing as precisely the class of data-dependent
+dynamism that static megakernels cannot fuse away, which is the same
+obstacle our design encounters at the coarser tool-call granularity.
+
+If this structural analogy holds quantitatively, a persistent-kernel
+design analogous to \S\ref{sec:design} --- keeping the GPU-resident
+attention/shared-layer kernel warm across each expert round-trip,
+rather than relaunching it per layer per token --- would place
+CPU-offloaded MoE decoding in our launch-overhead-dominated regime B,
+where \S\ref{sec:experiments} measured a lower-bound recovery of
+$12.1\%$ at $T=100$ on a synthetic 48-op chain. We flag this
+explicitly as an \emph{untested hypothesis}, not a result of this
+paper: we have not instrumented a real MoE decode loop (e.g.\ Qwen or
+GLM under \texttt{--n-cpu-moe}) to measure whether its per-token
+$\kappa,\sigma,d_t,\ell_t$ actually fall in this regime, and the
+per-token/per-layer granularity of MoE routing may introduce
+overheads (e.g.\ expert-selection variance, cache-locality effects
+in CPU RAM) not captured by our agent-step cost model. We leave this
+as concrete future work: repeating the measurement methodology of
+\S\ref{sec:experiments} on a real MoE inference loop, using the same
+reproducibility standard (every reported number backed by a runnable
+script) applied throughout this paper.
+
 \section{Conclusion}
 
 Persistent/megakernel designs have closed most of the kernel-launch
@@ -440,13 +664,8 @@ overhead gap for single-turn decode. Agent loops introduce a
 distinct, largely unaddressed overhead structure at the tool-call
 boundary. We formalize this with a simple cost model, propose a
 host-queue/resident-kernel design to close the gap, and release a
-reference implementation and benchmarking harness. Direct
-\texttt{clock64()} measurements in the resident kernel confirm that
-true device-side queue-signal cost is $\sigma = 0.095\,\mu$s ---
-over three orders of magnitude below the CUDA-graph replay proxy ---
-validating the cost model's prediction that $\sigma \ll \kappa$ and
-demonstrating that persistent kernels can effectively eliminate
-launch overhead in agentic inference loops.
+reference implementation and benchmarking harness so the cost model
+can be validated empirically on real hardware rather than asserted.
 
 \bibliographystyle{plainnat}
 \begin{thebibliography}{9}

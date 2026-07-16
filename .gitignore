@@ -26,12 +26,27 @@ build/
 *.snm
 *.vrb
 
-# Generated PDFs (compiled output — source is paper.tex)
+# Generated PDFs (track paper.pdf, ignore others)
 *.pdf
+!paper.pdf
 
 # Ephemeral build/run scripts
-compile.bat
-run.bat
+*.bat
+run.ps1
+
+# Agent session memory
+session/
+
+# Temp measurement artifacts
+kernel_output.txt
+kernel_error.txt
+check_cuda.py
+float.dtx
+float.sty
+float.zip
+float_pkg/
+.rightnow/
+.rightnowrules
 
 # CUDA build artifacts
 *.exe

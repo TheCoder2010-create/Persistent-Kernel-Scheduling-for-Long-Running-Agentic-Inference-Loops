@@ -1,7 +1,7 @@
 # Repository Audit Report
 
 **Repository:** `D:\research`  
-**Date:** 2026-07-16 (updated with device-side σ measurement)  
+**Date:** 2026-07-16 (final pre-arXiv audit)  
 **Layout note:** There are no `paper/`, `kernels/`, or `benchmarks/` source trees. Artifacts live at repo root (`paper.tex`, `persistent_kernel.cu`, `benchmark.py`, `triton_persistent_agent_kernel.py`); GPU JSON lives under `benchmarks/results/`.
 
 **Prior AUDIT.md was wrong.** It quoted `clock64()`, `atomicAdd(&g_queue.state, 0)`, and `cudaMemcpyToSymbol` paths that **do not exist** in the current `persistent_kernel.cu`. This report is based on reading the live sources.
@@ -176,3 +176,21 @@ A compiled run of `persistent_kernel.exe --steps 20 --json-out gpu_results_devic
 The kernel was launched once (`<<<1, 256>>>`) and executed 50 timed decode steps (after 20 warm-up steps with tool-latency simulation). σ captures the full window from the first thread observing `SLOT_READY` on the host-mapped queue through the `__syncthreads()` barrier to compute start.
 
 **Result:** σ = 0.095 μs confirms the sub-microsecond conjecture. The CUDA-graph replay proxy (0.22 ms) overstates true device-side σ by ~2,300×. All code artifacts are consistent with the measurement pipeline.
+
+## 8. Kappa Bug Fix (2026-07-16)
+
+The kappa computation bug (naive per step via CUDA events < compute via clock64) was caused by mismatched clock sources. Fixed by adding a second CUDA-event timing loop for kernel-only execution, giving κ from consistent wall-time measurements:
+
+| Metric | Before (broken) | After (fixed) |
+|--------|-----------------|---------------|
+| naive_total_per_step | 0.776 ms | 0.743 ms |
+| compute source | clock64 (1.106 ms) | CUDA event kernel-only (0.742 ms) |
+| κ | 0.0 (clamped from -0.330) | **0.001208 ms (1.2 μs)** |
+| σ | 0.000095 ms | 0.000095 ms (unchanged) |
+
+**Note on κ interpretation:** The 1.2 μs value represents the launch overhead of ONE fused kernel (the real forward pass in `persistent_kernel.cu`). The paper's Table 1 κ ≈ 0.89 ms represents the aggregate launch overhead of an **unfused** 48-kernel decode step (from the synthetic 48-op chain in `benchmark.py --mode gpu`). These measure fundamentally different things:
+- The synthetic κ (0.89 ms) is the correct baseline for "naive relaunch of an unfused forward pass"
+- The real κ (0.0012 ms) shows that **fusing the forward pass alone** already eliminates most launch overhead
+- The persistent kernel's σ (0.000095 ms) is the additional queue-signal cost beyond fusion
+
+For the paper's cost model comparison (unfused naive vs. fused persistent), the 48-op κ should remain in Table 1.

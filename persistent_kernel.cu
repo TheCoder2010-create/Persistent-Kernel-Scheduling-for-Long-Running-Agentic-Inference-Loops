@@ -697,7 +697,7 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize();
 
     double sigma_ms = 0.0, compute_ms = 0.0, persistent_host_ms = 0.0;
-    double naive_ms_per_step = 0.0;
+    double naive_ms_per_step = 0.0, naive_kernel_per_step = 0.0;
     int N_steps = 50;
 
     // ── Persistent kernel mode ──────────────────────────────────────────
@@ -835,23 +835,48 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaEventElapsedTime(&naive_ms, start_ev, end_ev));
         naive_ms_per_step = naive_ms / N_steps;
 
+        // Kernel-only CUDA-event timing (no H2D per step).
+        // This gives compute + launch overhead on the same wall-time clock
+        // as the total, avoiding the clock64-vs-wall-time mismatch.
+        cudaEvent_t ke_start, ke_end;
+        CUDA_CHECK(cudaEventCreate(&ke_start));
+        CUDA_CHECK(cudaEventCreate(&ke_end));
+        CUDA_CHECK(cudaEventRecord(ke_start, 0));
+        for (int t = 0; t < N_steps; t++) {
+            transformer_step_kernel<<<1, 256>>>(
+                d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        CUDA_CHECK(cudaEventRecord(ke_end, 0));
+        CUDA_CHECK(cudaEventSynchronize(ke_end));
+        float naive_kernel_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&naive_kernel_ms, ke_start, ke_end));
+        naive_kernel_per_step = naive_kernel_ms / N_steps;
+
         CUDA_CHECK(cudaEventDestroy(start_ev));
         CUDA_CHECK(cudaEventDestroy(end_ev));
+        CUDA_CHECK(cudaEventDestroy(ke_start));
+        CUDA_CHECK(cudaEventDestroy(ke_end));
         CUDA_CHECK(cudaFree(d_input));
         CUDA_CHECK(cudaFree(d_output));
 
         printf("\n=== Naive (relaunch-per-step, %d decode steps) ===\n", N_steps);
-        printf("  Total: %.3f ms\n", naive_ms);
-        printf("  Per step (kappa + compute + H2D): %.4f ms\n", naive_ms_per_step);
+        printf("  Total (H2D + launch + compute): %.3f ms\n", naive_ms);
+        printf("  Per step (H2D + launch + compute): %.4f ms\n", naive_ms_per_step);
+        printf("  Kernel-only (launch + compute, CUDA event): %.4f ms/step\n", naive_kernel_per_step);
     }
 
-    double kappa_ms = naive_ms_per_step - compute_ms;
+    double compute_ms_cuda_events = naive_kernel_per_step;
+    double kappa_ms = naive_ms_per_step - compute_ms_cuda_events;
     if (kappa_ms < 0.0) kappa_ms = 0.0;
 
     printf("\n=== Derived overheads (real forward pass) ===\n");
-    printf("  kappa (naive - compute):     %.6f ms\n", kappa_ms);
-    printf("  sigma (clock64 device-side): %.6f ms\n", sigma_ms);
-    printf("  kappa/sigma ratio:           %.1fx\n",
+    printf("  compute (CUDA event, naive kernel-only): %.6f ms\n", compute_ms_cuda_events);
+    printf("  compute (clock64, persistent kernel):    %.6f ms (cross-check)\n", compute_ms);
+    printf("  Total naive per step:                    %.6f ms\n", naive_ms_per_step);
+    printf("  kappa (naive total - kernel-only cuda):  %.6f ms\n", kappa_ms);
+    printf("  sigma (clock64 device-side):             %.6f ms\n", sigma_ms);
+    printf("  kappa/sigma ratio:                       %.1fx\n",
            sigma_ms > 0.0 ? kappa_ms / sigma_ms : 0.0);
 
     if (json_out) {
@@ -866,12 +891,14 @@ int main(int argc, char** argv) {
                 "  \"n_steps\": %d,\n"
                 "  \"sigma_ms\": %.8f,\n"
                 "  \"sigma_source\": \"clock64_device_side_queue_poll\",\n"
-                "  \"compute_ms\": %.8f,\n"
-                "  \"compute_source\": \"clock64_decode_segment\",\n"
+                "  \"clock64_compute_ms\": %.8f,\n"
+                "  \"clock64_compute_source\": \"clock64_decode_segment\",\n"
+                "  \"cuda_event_compute_ms\": %.8f,\n"
+                "  \"cuda_event_compute_source\": \"naive_kernel_only_cuda_event\",\n"
                 "  \"naive_ms_per_step\": %.8f,\n"
                 "  \"persistent_host_ms_per_step\": %.8f,\n"
                 "  \"kappa_ms\": %.8f,\n"
-                "  \"kappa_source\": \"naive_cuda_event_minus_clock64_compute\",\n"
+                "  \"kappa_source\": \"naive_total_minus_kernel_only_cuda_event\",\n"
                 "  \"sigma_cycles_total\": %llu,\n"
                 "  \"compute_cycles_total\": %llu,\n"
                 "  \"n_timed_steps\": %d\n"
@@ -880,6 +907,7 @@ int main(int argc, char** argv) {
                 N_LAYERS, DIM, N_HEADS, FFN_DIM,
                 N_steps,
                 sigma_ms, compute_ms,
+                compute_ms_cuda_events,
                 naive_ms_per_step, persistent_host_ms,
                 kappa_ms,
                 (unsigned long long)h_stats.sigma_cycles_total,
