@@ -29,13 +29,20 @@
 // ---------------------------------------------------------------------------
 // Configuration (matches benchmark.py --real-model defaults)
 // ---------------------------------------------------------------------------
+#ifdef LARGE_MODEL
+#define DIM          2048
+#define N_HEADS      16
+#define N_LAYERS     24
+#else
 #define DIM          256
 #define N_HEADS      4
-#define HEAD_DIM     (DIM / N_HEADS)   // 64
-#define MLP_RATIO    4
-#define FFN_DIM      (DIM * MLP_RATIO) // 1024
-#define MAX_SEQ_LEN  512
 #define N_LAYERS     2
+#endif
+
+#define HEAD_DIM     (DIM / N_HEADS)   // 64 for small, 128 for large
+#define MLP_RATIO    4
+#define FFN_DIM      (DIM * MLP_RATIO) // 1024 for small, 8192 for large
+#define MAX_SEQ_LEN  512
 #define EPS          1e-5f
 
 // ---------------------------------------------------------------------------
