@@ -1,0 +1,18 @@
+{
+  "device": "NVIDIA GeForce RTX 4050 Laptop GPU",
+  "sm": "89",
+  "clock_rate_khz": 1605000,
+  "model": {"n_layers": 2, "dim": 256, "n_heads": 4, "ffn_dim": 1024},
+  "n_steps": 50,
+  "sigma_ms": 0.00009470,
+  "sigma_source": "clock64_device_side_queue_poll",
+  "compute_ms": 1.10596121,
+  "compute_source": "clock64_decode_segment",
+  "naive_ms_per_step": 0.77590531,
+  "persistent_host_ms_per_step": 0.73893800,
+  "kappa_ms": 0.00000000,
+  "kappa_source": "naive_cuda_event_minus_clock64_compute",
+  "sigma_cycles_total": 7600,
+  "compute_cycles_total": 88753387,
+  "n_timed_steps": 50
+}

@@ -1,0 +1,18 @@
+{
+  "kernels": [],
+  "perKernelParams": {
+    "D:\\research\\triton_persistent_agent_kernel.py:decode_segment_kernel:36": {
+      "warmup": 5,
+      "benchmarkRuns": 100,
+      "iterations": 100,
+      "arraySize": 1024,
+      "kernelIterations": 10,
+      "dataType": "float",
+      "includeTransfers": 1,
+      "gridMode": "sweep",
+      "blockMode": "sweep",
+      "customParams": "{}"
+    }
+  },
+  "results": []
+}
