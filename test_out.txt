@@ -5,14 +5,19 @@
 
   h_queue=0000000204C00000 d_queue=0000000204C00000 sizeof(Entry)=2064
   Warmup: launching kernel for 2 steps
-  traj 0: compute=1075.4963 us  steps=50
+  Single naive kernel: 1610.75 us
+  Naive output sum: 149.240997 (should be non-zero)
+  traj 0: compute=1070.8894 us  steps=50
 
 === Results (N=1, 50 steps) ===
-  One-launch total:         53.811 ms
-  Wall per step:            1076.2260 us
-  compute (clock64):        1075.4963 us
-  kappa (naive single):     1102.8479 us
-  Amortized cost/step:     1076.2260 us  (kappa + compute)/step
-  Launch saving vs naive:  26.6219 us/step  (2.4%)
+  Naive total:                55.069 ms
+  Naive per step:             1101.3734 us
+  Batch total:                53.580 ms
+  Batch per step:             1071.5955 us
+  Compute (clock64):          1070.8894 us
+  Launch overhead per step:
+    Naive:                    30.4840 us
+    Batch:                    0.7061 us  (amortized)
+  Saving:                     29.7779 us/step  (2.7%)
 
 Done.

@@ -442,19 +442,31 @@ __global__ void persistent_multi_agent_kernel(
     // For V1, n_traj is fixed at 1 (single-trajectory mode).
     const int n_traj = 1;  // TODO: pass as kernel argument
 
+    // input_buffer / output_buffer placed at the END of the KV buffer
+    // (after all trajectory KV cache regions) to avoid overlap.
+    // Trajectory 0 uses offset 0 (same as naive baseline) for fair comparison.
+    float* input_buffer  = k_cache + MAX_N_TRAJ * KV_CACHE_PER_TRAJ;
+    float* output_buffer = v_cache + MAX_N_TRAJ * KV_CACHE_PER_TRAJ;
+    (void)queue;
+
     for (int step = 0; step < total_steps; step++) {
         for (int t = 0; t < n_traj; t++) {
-            int idx = t;  // each trajectory uses its queue slot
             int tid = t;
 
-            // Per-trajectory KV cache region
+            // Per-trajectory KV cache region — tid=0 uses offset 0 (same as naive)
             float* t_k_cache = k_cache + tid * KV_CACHE_PER_TRAJ;
             float* t_v_cache = v_cache + tid * KV_CACHE_PER_TRAJ;
             int*   t_kv_len  = kv_len  + tid * N_LAYERS;
 
+            // Reset KV length to 0 so each step sees an empty cache,
+            // matching the naive-per-step baseline.
+            if (threadIdx.x < N_LAYERS)
+                t_kv_len[threadIdx.x] = 0;
+            __syncthreads();
+
             unsigned long long t_start = clock64();
 
-            decode_segment((const float*)queue[idx].input, (float*)queue[idx].output,
+            decode_segment(input_buffer, output_buffer,
                            weights, t_k_cache, t_v_cache, t_kv_len, &ws);
             __syncthreads();
 
@@ -553,6 +565,7 @@ int main(int argc, char** argv) {
     int weights_floats = N_LAYERS * LAYER_FLOATS;
     int kv_floats_per_traj = N_LAYERS * KV_CACHE_LAYER_FLOATS;
     int kv_floats_total = MAX_N_TRAJ * kv_floats_per_traj;
+    int buf_floats = kv_floats_total + DIM;  // extra DIM for input/output buffer
 
     std::vector<float> h_weights(weights_floats);
     std::vector<float> h_k_cache(kv_floats_total, 0.0f);
@@ -565,8 +578,10 @@ int main(int argc, char** argv) {
     TrajStats *d_stats, h_stats[MAX_N_TRAJ] = {};
 
     CUDA_CHECK(cudaMalloc(&d_weights, weights_floats * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_k_cache, kv_floats_total * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_v_cache, kv_floats_total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_k_cache, buf_floats * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_v_cache, buf_floats * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_k_cache, 0, buf_floats * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_v_cache, 0, buf_floats * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_kv_len, MAX_N_TRAJ * N_LAYERS * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_stats, MAX_N_TRAJ * sizeof(TrajStats)));
     CUDA_CHECK(cudaMemset(d_stats, 0, MAX_N_TRAJ * sizeof(TrajStats)));
@@ -596,16 +611,17 @@ int main(int argc, char** argv) {
                kv_floats_total * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v_cache, h_v_cache.data(),
                kv_floats_total * sizeof(float), cudaMemcpyHostToDevice));
+    // input_buffer at offset kv_floats_total remains zero from cudaMemset
     CUDA_CHECK(cudaMemcpy(d_kv_len, h_kv_len.data(),
                MAX_N_TRAJ * N_LAYERS * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Fill queue with initial input data (mapped mem — GPU reads via UVA)
-    for (int i = 0; i < n_traj && i < MAX_N_TRAJ; i++) {
-        for (int d = 0; d < DIM; d++)
-            h_queue[i].input[d] = 0.01f * (float)((i * DIM + d) % 100);
-    }
-    _mm_sfence();
+    // Populate input_buffer at offset kv_floats_total (kernel reads from device mem)
+    std::vector<float> h_input(DIM);
+    for (int d = 0; d < DIM; d++)
+        h_input[d] = 0.01f * (float)(d % 100);
+    CUDA_CHECK(cudaMemcpy(d_k_cache + kv_floats_total, h_input.data(),
+               DIM * sizeof(float), cudaMemcpyHostToDevice));
 
     int N_timed = 50;
 
@@ -615,69 +631,42 @@ int main(int argc, char** argv) {
         d_weights, d_k_cache, d_v_cache, d_kv_len,
         d_queue_ptr, T, d_stats);
     CUDA_CHECK(cudaGetLastError());
-
-    // Wait for warmup kernel to finish
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // --- Timed run (one launch, N_timed steps) ---
-    CUDA_CHECK(cudaMemsetAsync(d_stats, 0, MAX_N_TRAJ * sizeof(TrajStats), stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    auto t0 = std::chrono::high_resolution_clock::now();
-
-    persistent_multi_agent_kernel<<<1, 256, 0, stream>>>(
-        d_weights, d_k_cache, d_v_cache, d_kv_len,
-        d_queue_ptr, N_timed, d_stats);
-    CUDA_CHECK(cudaGetLastError());
-    // Wait for kernel completion
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double wall_total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    double wall_per_step = wall_total_ms / N_timed;
-
-    // Read back stats
-    CUDA_CHECK(cudaMemcpy(h_stats, d_stats,
-               MAX_N_TRAJ * sizeof(TrajStats), cudaMemcpyDeviceToHost));
-
-    // Compute per-trajectory averages
-    double compute_us = 0.0;
-    n_traj = 1;  // single-trajectory only for now
-    for (int i = 0; i < n_traj; i++) {
-        if (h_stats[i].n_timed_steps > 0) {
-            compute_us = (double)h_stats[i].compute_cycles_total
-                         / h_stats[i].n_timed_steps / cycles_per_ms * 1000.0;
-            if (verbose) {
-                printf("  traj %d: compute=%.4f us  steps=%d\n",
-                       i, compute_us, h_stats[i].n_timed_steps);
-            }
-        }
-    }
-
-    // --- Naive baseline (one launch per step, N repeats) ---
-    double naive_kernel_only_us = 0.0;
+    // --- Naive baseline FIRST (one launch per step) ---
+    double naive_total_us = 0.0;  // total GPU time for N_timed naive calls
     {
         std::vector<int> zero_len(N_LAYERS, 0);
-        CUDA_CHECK(cudaMemcpy(d_kv_len, zero_len.data(),
-                   N_LAYERS * sizeof(int), cudaMemcpyHostToDevice));
-
-        std::vector<float> h_input(DIM);
         float *d_input, *d_output;
         CUDA_CHECK(cudaMalloc(&d_input, DIM * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_output, DIM * sizeof(float)));
+
+        CUDA_CHECK(cudaMemcpy(d_kv_len, zero_len.data(),
+                   N_LAYERS * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_input, h_input.data(),
+                   DIM * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         cudaEvent_t ks, ke;
         CUDA_CHECK(cudaEventCreate(&ks));
         CUDA_CHECK(cudaEventCreate(&ke));
 
+        // Single call timing
         CUDA_CHECK(cudaMemcpy(d_kv_len, zero_len.data(),
                    N_LAYERS * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaEventRecord(ks, stream));
+        transformer_step_kernel<<<1, 256, 0, stream>>>(
+            d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len);
+        CUDA_CHECK(cudaEventRecord(ke, stream));
+        CUDA_CHECK(cudaEventSynchronize(ke));
+        float tmp_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&tmp_ms, ks, ke));
+        if (verbose)
+            printf("  Single naive kernel: %.2f us\n", tmp_ms * 1000.0f);
 
-        // Warm up: copy once, then launch kernels in loop
-        CUDA_CHECK(cudaMemcpy(d_input, h_input.data(),
-                   DIM * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
+        // N_timed calls
+        CUDA_CHECK(cudaMemcpy(d_kv_len, zero_len.data(),
+                   N_LAYERS * sizeof(int), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaEventRecord(ks, stream));
         for (int t = 0; t < N_timed; t++) {
             transformer_step_kernel<<<1, 256, 0, stream>>>(
@@ -685,9 +674,17 @@ int main(int argc, char** argv) {
         }
         CUDA_CHECK(cudaEventRecord(ke, stream));
         CUDA_CHECK(cudaEventSynchronize(ke));
-        float naive_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&naive_ms, ks, ke));
-        naive_kernel_only_us = naive_ms / N_timed * 1000.0;
+        if (cudaEventElapsedTime(&tmp_ms, ks, ke) == cudaSuccess)
+            naive_total_us = (double)tmp_ms * 1000.0;
+
+        // Validate output changed
+        std::vector<float> h_check(DIM, 0.0f);
+        CUDA_CHECK(cudaMemcpy(h_check.data(), d_output,
+                   DIM * sizeof(float), cudaMemcpyDeviceToHost));
+        float sum_val = 0.0f;
+        for (int i = 0; i < DIM; i++) sum_val += h_check[i];
+        if (verbose)
+            printf("  Naive output sum: %.6f (should be non-zero)\n", (double)sum_val);
 
         CUDA_CHECK(cudaEventDestroy(ks));
         CUDA_CHECK(cudaEventDestroy(ke));
@@ -695,20 +692,57 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaFree(d_output));
     }
 
-    // --- Compute derived quantities ---
-    double kappa_us = naive_kernel_only_us;
-    // (no sigma cost in batch approach)
+    // --- Timed batch run (one launch, N_timed steps) ---
+    CUDA_CHECK(cudaMemsetAsync(d_stats, 0, MAX_N_TRAJ * sizeof(TrajStats), stream));
+    cudaEvent_t ks, ke;
+    CUDA_CHECK(cudaEventCreate(&ks));
+    CUDA_CHECK(cudaEventCreate(&ke));
+    CUDA_CHECK(cudaEventRecord(ks, stream));
+    persistent_multi_agent_kernel<<<1, 256, 0, stream>>>(
+        d_weights, d_k_cache, d_v_cache, d_kv_len,
+        d_queue_ptr, N_timed, d_stats);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(ke, stream));
+    CUDA_CHECK(cudaEventSynchronize(ke));
+    float wall_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&wall_ms, ks, ke));
+    double wall_total_ms = (double)wall_ms;
+    double wall_per_step_us = wall_total_ms * 1000.0 / N_timed;
+    CUDA_CHECK(cudaEventDestroy(ks));
+    CUDA_CHECK(cudaEventDestroy(ke));
+
+    // Read back stats
+    CUDA_CHECK(cudaMemcpy(h_stats, d_stats,
+               MAX_N_TRAJ * sizeof(TrajStats), cudaMemcpyDeviceToHost));
+    double compute_us = 0.0;
+    n_traj = 1;
+    for (int i = 0; i < n_traj; i++) {
+        if (h_stats[i].n_timed_steps > 0) {
+            compute_us = (double)h_stats[i].compute_cycles_total
+                         / h_stats[i].n_timed_steps / cycles_per_ms * 1000.0;
+            if (verbose)
+                printf("  traj %d: compute=%.4f us  steps=%d\n",
+                       i, compute_us, h_stats[i].n_timed_steps);
+        }
+    }
+
+    // --- Derived quantities ---
+    double naive_per_step_us = naive_total_us / N_timed;
+    double kappa_us = naive_per_step_us - compute_us; // pure launch overhead per step
+    double batch_overhead_us = wall_per_step_us - compute_us;
 
     printf("\n=== Results (N=%d, %d steps) ===\n", n_traj, N_timed);
-    printf("  One-launch total:         %.3f ms\n", wall_total_ms);
-    printf("  Wall per step:            %.4f us\n", wall_per_step * 1000.0);
-    printf("  compute (clock64):        %.4f us\n", compute_us);
-    printf("  kappa (naive single):     %.4f us\n", kappa_us);
-    printf("  Amortized cost/step:     %.4f us  (kappa + compute)/step\n",
-           wall_per_step * 1000.0);
-    printf("  Launch saving vs naive:  %.4f us/step  (%.1f%%)\n",
-           kappa_us - wall_per_step * 1000.0,
-           (kappa_us - wall_per_step * 1000.0) / kappa_us * 100.0);
+    printf("  Naive total:                %.3f ms\n", naive_total_us / 1000.0);
+    printf("  Naive per step:             %.4f us\n", naive_per_step_us);
+    printf("  Batch total:                %.3f ms\n", wall_total_ms);
+    printf("  Batch per step:             %.4f us\n", wall_per_step_us);
+    printf("  Compute (clock64):          %.4f us\n", compute_us);
+    printf("  Launch overhead per step:\n");
+    printf("    Naive:                    %.4f us\n", kappa_us);
+    printf("    Batch:                    %.4f us  (amortized)\n", batch_overhead_us);
+    printf("  Saving:                     %.4f us/step  (%.1f%%)\n",
+           naive_per_step_us - wall_per_step_us,
+           (naive_per_step_us - wall_per_step_us) / naive_per_step_us * 100.0);
 
     // --- Shutdown ---
     CUDA_CHECK(cudaStreamDestroy(stream));
@@ -724,20 +758,21 @@ int main(int argc, char** argv) {
                 "  \"clock_rate_khz\": %d,\n"
                 "  \"model\": {\"n_layers\": %d, \"dim\": %d, \"n_heads\": %d, \"ffn_dim\": %d},\n"
                 "  \"n_steps\": %d,\n"
-                "  \"wall_total_ms\": %.6f,\n"
-                "  \"wall_per_step_us\": %.4f,\n"
+                "  \"naive_per_step_us\": %.4f,\n"
+                "  \"batch_per_step_us\": %.4f,\n"
                 "  \"compute_us\": %.4f,\n"
-                "  \"kappa_us\": %.4f,\n"
-                "  \"launch_saving_us\": %.4f,\n"
-                "  \"launch_saving_pct\": %.2f\n"
+                "  \"kappa_naive_us\": %.4f,\n"
+                "  \"kappa_batch_us\": %.4f,\n"
+                "  \"saving_us\": %.4f,\n"
+                "  \"saving_pct\": %.2f\n"
                 "}\n",
                 prop.name, prop.major, prop.minor, clock_rate_khz,
                 N_LAYERS, DIM, N_HEADS, FFN_DIM,
                 N_timed,
-                wall_total_ms, wall_per_step * 1000.0,
-                compute_us, kappa_us,
-                kappa_us - wall_per_step * 1000.0,
-                (kappa_us - wall_per_step * 1000.0) / kappa_us * 100.0);
+                naive_per_step_us, wall_per_step_us,
+                compute_us, kappa_us, batch_overhead_us,
+                naive_per_step_us - wall_per_step_us,
+                (naive_per_step_us - wall_per_step_us) / naive_per_step_us * 100.0);
             fclose(f);
             printf("\nWrote %s\n", json_out);
         }
