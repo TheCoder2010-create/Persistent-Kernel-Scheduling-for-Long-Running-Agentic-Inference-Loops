@@ -41,7 +41,8 @@ kf_mean, kf_std = mean_std(kf)
 result = {
     "n_runs": n,
     "n_loop_launches": runs[0]["n_loop_launches"],
-    "n_per_launch": runs[0]["n_per_launch"],
+    "n_per_launch_real": runs[0]["n_per_launch_real"],
+    "n_per_launch_noop": runs[0]["n_per_launch_noop"],
     "device": runs[0]["device"],
     "sm": runs[0]["sm"],
     "clock_rate_khz": runs[0]["clock_rate_khz"],
@@ -84,10 +85,15 @@ result = {
 with open("kappa_fused_direct.json", "w") as f:
     json.dump(result, f, indent=2)
 
+noop_md_mean, noop_md_std = mean_std(noop_md)
+
 print(f"Aggregated {n} runs -> kappa_fused_direct.json")
 print()
-print(f"  kappa_fused:       {kf_mean*1000:.3f} +- {kf_std*1000:.3f} us")
-print(f"  range:             {min(kf)*1000:.3f} - {max(kf)*1000:.3f} us")
-print(f"  std/mean:          {kf_std / kf_mean:.4f}")
-print(f"  real per_step:     {mean_std(real_ps)[0]*1000:.3f} +- {mean_std(real_ps)[1]*1000:.3f} us")
-print(f"  compute (CUDA):    {mean_std(cc)[0]*1000:.3f} +- {mean_std(cc)[1]*1000:.3f} us")
+print(f"  kappa_fused (loop/N):        {kf_mean*1000:.3f} +- {kf_std*1000:.3f} us")
+print(f"  range:                       {min(kf)*1000:.3f} - {max(kf)*1000:.3f} us")
+print(f"  std/mean:                    {kf_std / kf_mean:.4f}")
+print(f"  noop per-launch median:      {noop_md_mean*1000:.3f} +- {noop_md_std*1000:.3f} us")
+print(f"  range:                       {min(noop_md)*1000:.3f} - {max(noop_md)*1000:.3f} us")
+print(f"  std/mean:                    {noop_md_std / noop_md_mean:.4f}")
+print(f"  real per_step:               {mean_std(real_ps)[0]*1000:.3f} +- {mean_std(real_ps)[1]*1000:.3f} us")
+print(f"  compute (CUDA event):        {mean_std(cc)[0]*1000:.3f} +- {mean_std(cc)[1]*1000:.3f} us")

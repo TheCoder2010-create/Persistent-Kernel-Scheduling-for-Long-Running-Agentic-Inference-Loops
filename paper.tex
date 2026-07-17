@@ -63,14 +63,12 @@ $\sigma = 0.095\,\mu\text{s}$/step (identical across all $N=10$
 runs). What this paper specifically contributes --- keeping an
 already-fused kernel \emph{resident} across tool-call boundaries ---
 saves $\kappa_{\text{fused}} - \sigma$, where
-$\kappa_{\text{fused}}$ is bounded above by $44\,\mu\text{s}$/step
-($N=10$ mean $\pm$ std: $18.6 \pm 13.1\,\mu\text{s}$; the wide
-variance reflects measurement noise from subtracting two
-$\sim$ms-scale CUDA-event timings, with the true value at the low
-end of the range, consistent with the H2D copy latency of
-$\sim$1\,KB for a single step's token embeddings). The marginal
-residency benefit is therefore at most $44\,\mu\text{s}$/step,
-under $0.1\%$ of a real decode-plus-tool-call step at this model
+$\kappa_{\text{fused}}$ is bounded above by $6.1\,\mu\text{s}$/step
+($N=10$ mean $\pm$ std of per-launch medians:
+$5.82 \pm 0.27\,\mu\text{s}$; for
+$2000$ per-launch samples each, std/mean$=0.047$). The marginal
+residency benefit is therefore at most $6.1\,\mu\text{s}$/step,
+under $0.01\%$ of a real decode-plus-tool-call step at this model
 size. Persistent-kernel scheduling's marginal value beyond fusion is
 real but small on current hardware at this model scale, and its
 practical significance depends on regimes with much smaller $d_t$
@@ -574,28 +572,22 @@ clock rate this is $\sigma = 0.095\,\mu\text{s}$ with
 quantity.
 
 The fused-kernel relaunch overhead
-$\kappa_{\text{fused}}$ is derived by subtraction: we time the
-naive loop (H2D copy of 256 floats plus one fused-kernel launch per
-step) with host-wall timing, and the kernel-only portion with CUDA
-events, then take the difference. Because both quantities are
-$\sim 0.74$\,ms/step --- two orders of magnitude larger than the
-$\sim 1\,\mu\text{s}$ difference --- the subtraction amplifies
-CUDA-event jitter, producing a wide measured distribution:
-$\kappa_{\text{fused}} = 18.6 \pm 13.1\,\mu\text{s}$ ($N=10$, range
-$[0, 44]\,\mu\text{s}$). Independent direct measurement of the H2D
-copy time for 256\,floats ($1$\,KB over PCIe Gen4) gives
-$\sim 1$--$5\,\mu\text{s}$, bounding the true
-$\kappa_{\text{fused}}$ to the low end of this range, consistent with
-the single-run value of $1.2\,\mu\text{s}$ reported in an earlier
-version of this analysis. The upper bound $44\,\mu\text{s}$ is a
-conservative ceiling set by the measurement-noise floor, not by
-physical launch overhead.
+$\kappa_{\text{fused}}$ is measured directly by launching a noop
+kernel (identical launch signature: 1 block $\times$ 256 threads,
+same parameter footprint) and timing each launch with a dedicated
+CUDA-event pair. Per-launch times across $2000$ consecutive launches
+in a single CUDA stream are recorded and summarized by their median;
+the loop-level $\text{total}/N$ estimate is rejected because it is
+inflated $16\%$ above the median (a first-launch warmup artifact)
+and shows $7\times$ higher run-to-run variance. Ten independent
+process launches ($N=10$, 20\,000 per-launch samples total) yield
+$\kappa_{\text{fused}} = 5.82 \pm 0.27\,\mu\text{s}$ (mean $\pm$ std
+of per-run medians, std/mean $= 0.047$).
 
 The marginal benefit of this paper's specific mechanism --- keeping an
 already-fused kernel resident rather than relaunching it per step ---
-is therefore $\kappa_{\text{fused}} - \sigma = 1$--$44\,\mu\text{s}$
-per step, with best estimate $1$--$5\,\mu\text{s}$ at the low end
-of the range. Against the \emph{unfused} 48-kernel-per-step baseline
+is therefore $\kappa_{\text{fused}} - \sigma = 5.6$--$6.1\,\mu\text{s}$
+per step ($\pm 1\sigma$). Against the \emph{unfused} 48-kernel-per-step baseline
 ($\kappa_{\text{unfused}} = 0.851\pm0.069$\,ms, $N=10$), fusing into
 one kernel alone eliminates over $98\%$ of the overhead
 ($\kappa_{\text{unfused}} - \kappa_{\text{fused}} \approx 0.83$\,ms/step)
@@ -603,10 +595,9 @@ one kernel alone eliminates over $98\%$ of the overhead
 Ada-MK \citep{mpk2025,kog2026,adamk2026} for single-turn decode, and
 is \emph{not} specific to this paper's proposed mechanism. The
 residency benefit beyond fusion, at its upper bound of
-$44\,\mu\text{s}$/step, remains under $0.1\%$ of a full
-decode-plus-tool-call step at this model size
-($d_t \approx 0.74$\,ms/step, regime-A tool latency
-$\ell_t \sim \mathcal{U}(50,200)$\,ms). The $13.6$--$14.5\%$ recovery
+$6.1\,\mu\text{s}$/step, is under $0.83\%$ of the compute-only
+step time and negligible compared with tool-call latency
+($\ell_t \sim \mathcal{U}(50,200)$\,ms). The $13.6$--$14.5\%$ recovery
 figures reported earlier in this section therefore over-attribute
 credit: they compare against an \emph{unfused} baseline, which is the
 regime prior megakernel work already addresses, rather than isolating
@@ -637,14 +628,13 @@ design against an \emph{unfused}, multi-kernel-per-step baseline, and
 so mostly measure the value of \emph{kernel fusion} --- already
 established by MPK, Kog, and Ada-MK \citep{mpk2025,kog2026,adamk2026}
 --- rather than this paper's specific proposed mechanism. Direct
-device-side measurement of \texttt{persistent\_kernel.cu}'s own real
-forward pass (\S\ref{sec:discrepancy}, point 5) isolates the marginal
-contribution of residency \emph{beyond} fusion:
-$\kappa_{\text{fused}} - \sigma = 1$--$44\,\mu\text{s}$/step
-($N=10$, mean $\pm$ std: $18.6 \pm 13.1\,\mu\text{s}$; see
-\S\ref{sec:discrepancy} for the discussion of measurement noise at
-the low end of this range), under $0.1\%$ of a full
-decode-plus-tool-call step at this model size ($N_{\text{LAYERS}}=2$,
+device-side measurement of the fused-kernel launch overhead via a
+noop-kernel proxy (\S\ref{sec:discrepancy}, point 5) isolates the
+marginal contribution of residency \emph{beyond} fusion:
+$\kappa_{\text{fused}} - \sigma = 5.6$--$6.1\,\mu\text{s}$/step
+($N=10$, per-launch median $= 5.82 \pm 0.27\,\mu\text{s}$; see
+\S\ref{sec:discrepancy} for methodology), under $0.83\%$ of the
+compute-only step time at this model size ($N_{\text{LAYERS}}=2$,
 $\text{DIM}=256$). We report this explicitly rather than let the
 larger, fusion-driven figure stand as if it were evidence for the
 paper's contribution: on current hardware and at this model scale,

@@ -647,6 +647,73 @@ int main(int argc, char** argv) {
                noop_loop_total_ms, noop_per_step_ms);
     }
 
+    // ── Measurement B2: forced-sync noop kernel (single event pair) ────
+    // Same noop loop, but call cudaStreamSynchronize() after EVERY launch.
+    // This defeats WDDM command-buffer batching: each launch is fully
+    // dispatched and completed before the next begins.
+    // The total includes full GPU round-trip sync overhead per launch.
+    cudaEvent_t lns_start, lns_end;
+    CUDA_CHECK(cudaEventCreate(&lns_start));
+    CUDA_CHECK(cudaEventCreate(&lns_end));
+
+    CUDA_CHECK(cudaEventRecord(lns_start, stream));
+    for (int i = 0; i < N; i++) {
+        noop_kernel<<<1, 256, 0, stream>>>(
+            d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len, nullptr);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    CUDA_CHECK(cudaEventRecord(lns_end, stream));
+    CUDA_CHECK(cudaEventSynchronize(lns_end));
+
+    float noop_sync_loop_total_ms;
+    CUDA_CHECK(cudaEventElapsedTime(&noop_sync_loop_total_ms, lns_start, lns_end));
+    double noop_sync_per_step_ms = noop_sync_loop_total_ms / N;
+
+    // Also record per-launch times for the forced-sync noop variant
+    // to get distribution stats (median, IQR) with sync.
+    int N_sync_per = std::min(N, 2000);
+    std::vector<cudaEvent_t> pns_start(N_sync_per), pns_end(N_sync_per);
+    for (int i = 0; i < N_sync_per; i++) {
+        CUDA_CHECK(cudaEventCreate(&pns_start[i]));
+        CUDA_CHECK(cudaEventCreate(&pns_end[i]));
+    }
+    for (int i = 0; i < N_sync_per; i++) {
+        CUDA_CHECK(cudaEventRecord(pns_start[i], stream));
+        noop_kernel<<<1, 256, 0, stream>>>(
+            d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len, nullptr);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaEventRecord(pns_end[i], stream));
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> per_noop_sync_ms(N_sync_per);
+    for (int i = 0; i < N_sync_per; i++) {
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, pns_start[i], pns_end[i]));
+        per_noop_sync_ms[i] = ms;
+    }
+    for (int i = 0; i < N_sync_per; i++) {
+        CUDA_CHECK(cudaEventDestroy(pns_start[i]));
+        CUDA_CHECK(cudaEventDestroy(pns_end[i]));
+    }
+    Stats s_noop_sync = compute_stats(per_noop_sync_ms);
+
+    CUDA_CHECK(cudaEventDestroy(lns_start));
+    CUDA_CHECK(cudaEventDestroy(lns_end));
+
+    if (verbose) {
+        printf("\n  Noop kernel FORCED SYNC (N=%d, stream sync after each launch):\n", N);
+        printf("    loop total = %.6f ms, per_step = %.6f ms\n",
+               noop_sync_loop_total_ms, noop_sync_per_step_ms);
+        printf("    per-launch stats (N=%d):\n", N_sync_per);
+        printf("      median = %.6f ms, mean = %.6f ms, std = %.6f ms\n",
+               s_noop_sync.median, s_noop_sync.mean, s_noop_sync.std);
+        printf("      p25 = %.6f ms, p75 = %.6f ms\n",
+               s_noop_sync.p25, s_noop_sync.p75);
+        printf("      std/mean = %.4f\n",
+               s_noop_sync.std / (s_noop_sync.mean > 0 ? s_noop_sync.mean : 1));
+    }
+
     // ── Measurement C: per-launch event pairs (for distribution) ──────
     // Real kernel per-launch times — gives median, IQR, min, max.
     // Use a fresh KV cache segment so seq_len stays small.
@@ -654,14 +721,14 @@ int main(int argc, char** argv) {
                cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_stats, 0, sizeof(KernelStats)));
 
-    int N_per = std::min(N, 100);  // profile fewer launches for per-launch dist
-    std::vector<cudaEvent_t> ps_start(N_per), ps_end(N_per);
-    for (int i = 0; i < N_per; i++) {
+    int N_per_real = std::min(N, 100);  // profile fewer launches for real kernel per-launch dist
+    std::vector<cudaEvent_t> ps_start(N_per_real), ps_end(N_per_real);
+    for (int i = 0; i < N_per_real; i++) {
         CUDA_CHECK(cudaEventCreate(&ps_start[i]));
         CUDA_CHECK(cudaEventCreate(&ps_end[i]));
     }
 
-    for (int i = 0; i < N_per; i++) {
+    for (int i = 0; i < N_per_real; i++) {
         CUDA_CHECK(cudaEventRecord(ps_start[i], stream));
         transformer_step_kernel<<<1, 256, 0, stream>>>(
             d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len, d_stats);
@@ -669,13 +736,13 @@ int main(int argc, char** argv) {
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    std::vector<float> per_real_ms(N_per);
-    for (int i = 0; i < N_per; i++) {
+    std::vector<float> per_real_ms(N_per_real);
+    for (int i = 0; i < N_per_real; i++) {
         float ms;
         CUDA_CHECK(cudaEventElapsedTime(&ms, ps_start[i], ps_end[i]));
         per_real_ms[i] = ms;
     }
-    for (int i = 0; i < N_per; i++) {
+    for (int i = 0; i < N_per_real; i++) {
         CUDA_CHECK(cudaEventDestroy(ps_start[i]));
         CUDA_CHECK(cudaEventDestroy(ps_end[i]));
     }
@@ -686,21 +753,22 @@ int main(int argc, char** argv) {
                cudaMemcpyDeviceToHost));
 
     if (verbose) {
-        printf("\n  Real kernel per-launch (N=%d, CUDA event pairs):\n", N_per);
+        printf("\n  Real kernel per-launch (N=%d, CUDA event pairs):\n", N_per_real);
         printf("    median = %.6f ms, mean = %.6f ms, std = %.6f ms\n",
                s_real.median, s_real.mean, s_real.std);
         printf("    p25 = %.6f ms, p75 = %.6f ms\n", s_real.p25, s_real.p75);
         printf("    min = %.6f ms, max = %.6f ms\n", s_real.min, s_real.max);
     }
 
-    // Noop per-launch times
-    std::vector<cudaEvent_t> pn_start(N_per), pn_end(N_per);
-    for (int i = 0; i < N_per; i++) {
+    // Noop per-launch times — use many more samples for a stable median
+    int N_per_noop = 2000;  // 20x more than the original 100
+    std::vector<cudaEvent_t> pn_start(N_per_noop), pn_end(N_per_noop);
+    for (int i = 0; i < N_per_noop; i++) {
         CUDA_CHECK(cudaEventCreate(&pn_start[i]));
         CUDA_CHECK(cudaEventCreate(&pn_end[i]));
     }
 
-    for (int i = 0; i < N_per; i++) {
+    for (int i = 0; i < N_per_noop; i++) {
         CUDA_CHECK(cudaEventRecord(pn_start[i], stream));
         noop_kernel<<<1, 256, 0, stream>>>(
             d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len, nullptr);
@@ -708,22 +776,24 @@ int main(int argc, char** argv) {
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    std::vector<float> per_noop_ms(N_per);
-    for (int i = 0; i < N_per; i++) {
+    std::vector<float> per_noop_ms(N_per_noop);
+    for (int i = 0; i < N_per_noop; i++) {
         float ms;
         CUDA_CHECK(cudaEventElapsedTime(&ms, pn_start[i], pn_end[i]));
         per_noop_ms[i] = ms;
     }
-    for (int i = 0; i < N_per; i++) {
+    for (int i = 0; i < N_per_noop; i++) {
         CUDA_CHECK(cudaEventDestroy(pn_start[i]));
         CUDA_CHECK(cudaEventDestroy(pn_end[i]));
     }
     Stats s_noop = compute_stats(per_noop_ms);
 
     if (verbose) {
-        printf("  Noop kernel per-launch (N=%d, CUDA event pairs):\n", N_per);
+        printf("  Noop kernel per-launch (N=%d, CUDA event pairs):\n", N_per_noop);
         printf("    median = %.6f ms, mean = %.6f ms, std = %.6f ms\n",
                s_noop.median, s_noop.mean, s_noop.std);
+        printf("    p25 = %.6f ms, p75 = %.6f ms\n", s_noop.p25, s_noop.p75);
+        printf("    std/mean = %.4f\n", s_noop.std / (s_noop.mean > 0 ? s_noop.mean : 1));
     }
 
     // ── Derived κ_fused ──────────────────────────────────────────────
@@ -747,16 +817,34 @@ int main(int argc, char** argv) {
     printf("\n=== Results ===\n");
     printf("  Real kernel loop:       total = %.3f ms, per_step = %.6f ms\n",
            real_loop_total_ms, real_per_step_ms);
-    printf("  Noop  kernel loop:      total = %.6f ms, per_step = %.6f ms\n",
+    printf("\n--- No-sync (WDDM batched) ---\n");
+    printf("  Noop loop:              total = %.6f ms, per_step = %.6f ms\n",
            noop_loop_total_ms, noop_per_step_ms);
-    printf("  κ_fused (noop loop / N):       %.6f ms  (%.3f us)\n",
+    printf("  κ_fused (noop loop / N):        %.6f ms  (%.3f us)\n",
            kappa_fused_ms, kappa_fused_us);
-    printf("  real loop - κ_fused (≈compute): %.6f ms\n", compute_cuda_event_ms);
+    printf("  Noop per-launch median  (N=%d): %.6f ms\n", N_per_noop, s_noop.median);
+    printf("  Noop per-launch mean    (N=%d): %.6f ms\n", N_per_noop, s_noop.mean);
+    printf("  Noop per-launch std     (N=%d): %.6f ms\n", N_per_noop, s_noop.std);
+    printf("  Noop per-launch std/mean:       %.4f\n",
+           s_noop.std / (s_noop.mean > 0 ? s_noop.mean : 1));
+    printf("  Noop per-launch p25/p75:        %.6f / %.6f ms\n", s_noop.p25, s_noop.p75);
+    printf("\n--- Forced-sync (per-launch stream sync) ---\n");
+    printf("  Noop sync loop:         total = %.6f ms, per_step = %.6f ms\n",
+           noop_sync_loop_total_ms, noop_sync_per_step_ms);
+    printf("  κ_fused_sync (sync loop / N):   %.6f ms  (%.3f us)\n",
+           noop_sync_per_step_ms, noop_sync_per_step_ms * 1000.0);
+    printf("  Noop sync per-launch median:    %.6f ms\n", s_noop_sync.median);
+    printf("  Noop sync per-launch mean:      %.6f ms\n", s_noop_sync.mean);
+    printf("  Noop sync per-launch std:       %.6f ms\n", s_noop_sync.std);
+    printf("  Noop sync per-launch std/mean:  %.4f\n",
+           s_noop_sync.std / (s_noop_sync.mean > 0 ? s_noop_sync.mean : 1));
+    printf("  Noop sync per-launch p25/p75:   %.6f / %.6f ms\n", s_noop_sync.p25, s_noop_sync.p75);
+    printf("\n--- Derived ---\n");
+    printf("  real loop - κ_fused (compute):  %.6f ms\n", compute_cuda_event_ms);
     printf("  clock64 compute (at base):      %.6f ms  (%s)\n",
            compute_ms_at_base, verbose ? "" : "use --verbose for cycles");
     printf("  clock64 cycles/step:            %.0f\n", compute_cycles_per_step);
-    printf("  Real per-launch median (N=%d):  %.6f ms\n", N_per, s_real.median);
-    printf("  Noop per-launch median  (N=%d): %.6f ms\n", N_per, s_noop.median);
+    printf("  Real per-launch median (N=%d):  %.6f ms\n", N_per_real, s_real.median);
 
     CUDA_CHECK(cudaEventDestroy(lr_start));
     CUDA_CHECK(cudaEventDestroy(lr_end));
@@ -784,7 +872,8 @@ int main(int argc, char** argv) {
                 "  \"n_warmup_batches\": %d,\n"
                 "  \"n_warmup_per_batch\": %d,\n"
                 "  \"n_loop_launches\": %d,\n"
-                "  \"n_per_launch\": %d,\n"
+                "  \"n_per_launch_real\": %d,\n"
+                "  \"n_per_launch_noop\": %d,\n"
                 "  \"real_loop_total_ms\": %.8f,\n"
                 "  \"real_per_step_ms\": %.8f,\n"
                 "  \"noop_loop_total_ms\": %.8f,\n"
@@ -816,12 +905,26 @@ int main(int argc, char** argv) {
                 "    \"min\": %.8f,\n"
                 "    \"max\": %.8f,\n"
                 "    \"unit\": \"ms\"\n"
+                "  },\n"
+                "  \"noop_sync_loop_total_ms\": %.8f,\n"
+                "  \"noop_sync_per_step_ms\": %.8f,\n"
+                "  \"kappa_fused_sync_ms\": %.8f,\n"
+                "  \"kappa_fused_sync_us\": %.4f,\n"
+                "  \"per_launch_noop_sync_ms\": {\n"
+                "    \"median\": %.8f,\n"
+                "    \"mean\": %.8f,\n"
+                "    \"std\": %.8f,\n"
+                "    \"p25\": %.8f,\n"
+                "    \"p75\": %.8f,\n"
+                "    \"min\": %.8f,\n"
+                "    \"max\": %.8f,\n"
+                "    \"unit\": \"ms\"\n"
                 "  }\n"
                 "}\n",
                 prop.name, prop.major, prop.minor, clock_rate_khz,
                 N_LAYERS, DIM, N_HEADS, FFN_DIM,
                 n_warmup_batches, N,
-                N, N_per,
+                N, N_per_real, N_per_noop,
                 real_loop_total_ms, real_per_step_ms,
                 noop_loop_total_ms, noop_per_step_ms,
                 kappa_fused_ms, kappa_fused_us,
@@ -831,7 +934,11 @@ int main(int argc, char** argv) {
                 s_real.median, s_real.mean, s_real.std,
                 s_real.p25, s_real.p75, s_real.min, s_real.max,
                 s_noop.median, s_noop.mean, s_noop.std,
-                s_noop.p25, s_noop.p75, s_noop.min, s_noop.max);
+                s_noop.p25, s_noop.p75, s_noop.min, s_noop.max,
+                noop_sync_loop_total_ms, noop_sync_per_step_ms,
+                noop_sync_per_step_ms, noop_sync_per_step_ms * 1000.0,
+                s_noop_sync.median, s_noop_sync.mean, s_noop_sync.std,
+                s_noop_sync.p25, s_noop_sync.p75, s_noop_sync.min, s_noop_sync.max);
             fclose(f);
             printf("\nWrote %s\n", json_out);
         } else {
