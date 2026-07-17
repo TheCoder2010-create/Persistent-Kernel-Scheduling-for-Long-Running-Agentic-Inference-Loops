@@ -53,7 +53,7 @@ implementation together with a benchmarking harness that isolates
 launch-overhead cost specifically in multi-step tool-calling loops
 (as opposed to raw decode). Hardware measurements on an RTX 4050
 Laptop GPU show that, against an \emph{unfused}, multi-kernel-per-step
-baseline, a fused-and-resident design recovers up to $16.1\%$ of
+baseline, a fused-and-resident design recovers $14.5\%$ of
 wall-clock time at $T=100$ in launch-overhead-dominated scenarios ---
 but direct device-side instrumentation over $N=10$ independent
 process launches confirms that over $98\%$ of that saving comes from
@@ -63,13 +63,12 @@ $\sigma = 0.095\,\mu\text{s}$/step (identical across all $N=10$
 runs). What this paper specifically contributes --- keeping an
 already-fused kernel \emph{resident} across tool-call boundaries ---
 saves $\kappa_{\text{fused}} - \sigma$, where
-$\kappa_{\text{fused}}$ is bounded above by $6.1\,\mu\text{s}$/step
-($N=10$ mean $\pm$ std of per-launch medians:
-$5.82 \pm 0.27\,\mu\text{s}$; for
-$2000$ per-launch samples each, std/mean$=0.047$). The marginal
-residency benefit is therefore at most $6.1\,\mu\text{s}$/step,
-under $0.01\%$ of a real decode-plus-tool-call step at this model
-size. Persistent-kernel scheduling's marginal value beyond fusion is
+$\kappa_{\text{fused}} = 5.82 \pm 0.27\,\mu\text{s}$
+($N=10$ independent runs, per-launch median, $2000$ samples/run).
+The marginal residency benefit $\kappa_{\text{fused}} - \sigma =
+5.725\,\mu\text{s}$/step is $0.011\%$ of a full decode-plus-tool-call
+step ($d_t + \ell_t$, $\ell_t \geq 50$\,ms), safely under
+$0.02\%$ at this model size. Persistent-kernel scheduling's marginal value beyond fusion is
 real but small on current hardware at this model scale, and its
 practical significance depends on regimes with much smaller $d_t$
 or much higher step-call frequency than tested here.
@@ -501,18 +500,21 @@ Ada Lovelace's improved kernel-dispatch pipeline and the 610-series
 driver's reduced host-side submission latency both contribute. Future
 measurements on Hopper (H100) and Blackwell-class GPUs may differ.
 
-\textbf{(2) The $\sigma = \kappa/20$ assumption does not hold for CUDA-graph replay.}
+\textbf{(2) The $\sigma = \kappa/20$ assumption is still an overestimate,
+but less severely than the single-run data suggested.}
 The simulation modeled queue-signal cost as $\sigma = \kappa/20$,
 reflecting the expectation that a true device-side spin-poll costs
-only a queue-write plus a warp wake-up. In the hardware benchmark,
-$\sigma$ is measured as the latency of replaying a pre-compiled
-CUDA graph of the 48-op chain --- the framework-level analogue of
-single-dispatch re-issue. The measured $\sigma/\kappa$ ratio is
-$\approx 1/4$ (not $1/20$), because CUDA-graph replay still traverses
-the driver's graph-execution path and pays real per-node scheduling
-overhead; it is \emph{not} equivalent to device-side residency where
-warps never exit the kernel. This is the primary reason the measured
-recoverable fraction is roughly half the simulated value.
+only a queue-write plus a warp wake-up. The $N=10$ measurement gives
+$\sigma/\kappa \approx 1/11$--$1/15$ (regime A: $0.070/0.789 \approx
+1/11$; regime B: $0.057/0.851 \approx 1/15$), which is closer to the
+assumed $1/20$ than the earlier single-run estimate of $\approx 1/4$.
+CUDA-graph replay thus adds measurable per-node scheduling overhead
+beyond an ideal device-side queue, but the gap from the ideal is
+smaller than the initial noisy measurement implied. The primary
+driver of the gap between simulated ($\sim23\%$) and measured
+($\sim12\%$) recovery in regime B is therefore the lower $\kappa$ on
+Ada Lovelace (factor~1), with the $\sigma$-overestimate playing a
+secondary role.
 
 \textbf{(3) $\sigma$ is a hardware-fixed floor, not workload-dependent.}
 Across both regimes, the measured $\sigma$ values are nearly identical:
@@ -582,7 +584,15 @@ inflated $16\%$ above the median (a first-launch warmup artifact)
 and shows $7\times$ higher run-to-run variance. Ten independent
 process launches ($N=10$, 20\,000 per-launch samples total) yield
 $\kappa_{\text{fused}} = 5.82 \pm 0.27\,\mu\text{s}$ (mean $\pm$ std
-of per-run medians, std/mean $= 0.047$).
+of per-run medians, std/mean $= 0.047$).\footnote{An initial
+subtraction-based estimate (naive-loop total minus kernel-only
+CUDA-event timings) gave $\kappa_{\text{fused}} = 1.11\,\mu\text{s}$,
+but this was found to cancel out launch overhead rather than measure
+it --- effectively capturing only H2D copy time. Direct per-launch
+CUDA-event timing on a noop kernel (same launch signature, $N=10$
+runs $\times$ $2000$ samples) corrected this to
+$5.82 \pm 0.27\,\mu\text{s}$ (std/mean $= 0.047$), the figure used
+throughout this paper.}
 
 The marginal benefit of this paper's specific mechanism --- keeping an
 already-fused kernel resident rather than relaunching it per step ---
@@ -595,9 +605,11 @@ one kernel alone eliminates over $98\%$ of the overhead
 Ada-MK \citep{mpk2025,kog2026,adamk2026} for single-turn decode, and
 is \emph{not} specific to this paper's proposed mechanism. The
 residency benefit beyond fusion, at its upper bound of
-$6.1\,\mu\text{s}$/step, is under $0.83\%$ of the compute-only
-step time and negligible compared with tool-call latency
-($\ell_t \sim \mathcal{U}(50,200)$\,ms). The $13.6$--$14.5\%$ recovery
+$6.1\,\mu\text{s}$/step, is $0.012\%$ of a full decode-plus-tool-call
+step ($d_t + \ell_t$, $\ell_t \geq 50$\,ms); as a fraction of compute
+time alone it is $0.83\%$, included only for readers accustomed to
+GPU-only timing. Both figures are negligible compared with tool-call
+latency ($\ell_t \sim \mathcal{U}(50,200)$\,ms). The $13.6$--$14.5\%$ recovery
 figures reported earlier in this section therefore over-attribute
 credit: they compare against an \emph{unfused} baseline, which is the
 regime prior megakernel work already addresses, rather than isolating
@@ -633,9 +645,9 @@ noop-kernel proxy (\S\ref{sec:discrepancy}, point 5) isolates the
 marginal contribution of residency \emph{beyond} fusion:
 $\kappa_{\text{fused}} - \sigma = 5.6$--$6.1\,\mu\text{s}$/step
 ($N=10$, per-launch median $= 5.82 \pm 0.27\,\mu\text{s}$; see
-\S\ref{sec:discrepancy} for methodology), under $0.83\%$ of the
-compute-only step time at this model size ($N_{\text{LAYERS}}=2$,
-$\text{DIM}=256$). We report this explicitly rather than let the
+\S\ref{sec:discrepancy} for methodology), $0.012\%$ of a full
+decode-plus-tool-call step ($d_t + \ell_t$, $\ell_t \geq 50$\,ms);
+as a fraction of compute time alone it is $0.83\%$. We report this explicitly rather than let the
 larger, fusion-driven figure stand as if it were evidence for the
 paper's contribution: on current hardware and at this model scale,
 persistent residency's benefit \emph{beyond} an already-fused kernel
