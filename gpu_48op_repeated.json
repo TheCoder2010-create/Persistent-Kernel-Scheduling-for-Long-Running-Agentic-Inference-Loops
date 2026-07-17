@@ -1,0 +1,144 @@
+[
+  {
+    "regime": "A",
+    "label": "tool-latency-dominated",
+    "n_runs": 10,
+    "n_ops_per_step": 48,
+    "sigma_source": "cuda_graph_replay_proxy",
+    "kappa_ms": {
+      "mean": 0.789216,
+      "std": 0.035459,
+      "min": 0.7462,
+      "max": 0.85082
+    },
+    "sigma_ms": {
+      "mean": 0.070156,
+      "std": 0.002044,
+      "min": 0.06768,
+      "max": 0.07372
+    },
+    "per_run": [
+      {
+        "run": 0,
+        "kappa_ms": 0.83142,
+        "sigma_ms": 0.07251
+      },
+      {
+        "run": 1,
+        "kappa_ms": 0.7462,
+        "sigma_ms": 0.07372
+      },
+      {
+        "run": 2,
+        "kappa_ms": 0.77551,
+        "sigma_ms": 0.07091
+      },
+      {
+        "run": 3,
+        "kappa_ms": 0.85082,
+        "sigma_ms": 0.06768
+      },
+      {
+        "run": 4,
+        "kappa_ms": 0.78872,
+        "sigma_ms": 0.07048
+      },
+      {
+        "run": 5,
+        "kappa_ms": 0.81303,
+        "sigma_ms": 0.07072
+      },
+      {
+        "run": 6,
+        "kappa_ms": 0.80402,
+        "sigma_ms": 0.06773
+      },
+      {
+        "run": 7,
+        "kappa_ms": 0.75284,
+        "sigma_ms": 0.0677
+      },
+      {
+        "run": 8,
+        "kappa_ms": 0.75067,
+        "sigma_ms": 0.06966
+      },
+      {
+        "run": 9,
+        "kappa_ms": 0.77893,
+        "sigma_ms": 0.07045
+      }
+    ]
+  },
+  {
+    "regime": "B",
+    "label": "launch-overhead-dominated",
+    "n_runs": 10,
+    "n_ops_per_step": 48,
+    "sigma_source": "cuda_graph_replay_proxy",
+    "kappa_ms": {
+      "mean": 0.851414,
+      "std": 0.06903,
+      "min": 0.77868,
+      "max": 1.0165
+    },
+    "sigma_ms": {
+      "mean": 0.057444,
+      "std": 0.009714,
+      "min": 0.04709,
+      "max": 0.0788
+    },
+    "per_run": [
+      {
+        "run": 0,
+        "kappa_ms": 0.82472,
+        "sigma_ms": 0.05455
+      },
+      {
+        "run": 1,
+        "kappa_ms": 0.81284,
+        "sigma_ms": 0.05159
+      },
+      {
+        "run": 2,
+        "kappa_ms": 0.77868,
+        "sigma_ms": 0.04946
+      },
+      {
+        "run": 3,
+        "kappa_ms": 0.80182,
+        "sigma_ms": 0.05095
+      },
+      {
+        "run": 4,
+        "kappa_ms": 0.82168,
+        "sigma_ms": 0.0533
+      },
+      {
+        "run": 5,
+        "kappa_ms": 0.89849,
+        "sigma_ms": 0.06224
+      },
+      {
+        "run": 6,
+        "kappa_ms": 0.89384,
+        "sigma_ms": 0.06712
+      },
+      {
+        "run": 7,
+        "kappa_ms": 0.83941,
+        "sigma_ms": 0.05934
+      },
+      {
+        "run": 8,
+        "kappa_ms": 1.0165,
+        "sigma_ms": 0.0788
+      },
+      {
+        "run": 9,
+        "kappa_ms": 0.82616,
+        "sigma_ms": 0.04709
+      }
+    ]
+  }
+]

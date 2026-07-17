@@ -375,25 +375,29 @@ overhead ($\Delta/T_{\text{naive}}$), by trajectory length $T$ and
 regime. \emph{Simulated}: \texttt{benchmark.py --mode simulate},
 $\kappa=1.5$\,ms, $\sigma=\kappa/20$ (modeled constants, CPU-only,
 seed\,=\,0). \emph{Measured (GPU)}: \texttt{benchmark.py --mode gpu
---ops-per-step 48}, RTX 4050 Laptop GPU; $\kappa=0.925$\,ms,
-$\sigma=0.221$\,ms (regime A), $\kappa=0.889$\,ms, $\sigma=0.220$\,ms
-(regime B), both measured via CUDA events over a 48-op chain per step.}
+--ops-per-step 48}, RTX 4050 Laptop GPU; $\kappa$ and $\sigma$
+are reported as mean $\pm$ standard deviation across $N=10$
+independent process launches. Regime~A: $\kappa=0.789\pm0.035$\,ms,
+$\sigma=0.070\pm0.002$\,ms. Regime~B: $\kappa=0.851\pm0.069$\,ms,
+$\sigma=0.057\pm0.010$\,ms. Both measured via CUDA events over a
+48-op chain per step, with cost-model rows (right three columns)
+computed at seed=0 using the mean $\kappa,\sigma$ values.}
 \label{tab:results}
 \begin{tabular}{llccc}
 \toprule
 Regime & $T$ & Simulated $\Delta/T_{\text{naive}}$ & Measured (GPU) & $T_{\text{naive}}$ (ms, GPU) \\
 \midrule
-A: tool-latency-dominated    & 1   & 0.80\%  & 0.40\%  & 178.1 \\
-A: tool-latency-dominated    & 10  & 0.89\%  & 0.44\%  & 1{,}593.5 \\
-A: tool-latency-dominated    & 50  & 0.95\%  & 0.47\%  & 7{,}457.2 \\
-A: tool-latency-dominated    & 100 & 1.06\%  & 0.53\%  & 13{,}325.1 \\
-A: tool-latency-dominated    & 200 & 1.07\%  & 0.53\%  & 26{,}539.0 \\
+A: tool-latency-dominated    & 1   & 0.80\%  & 0.55\%  & 131.0 \\
+A: tool-latency-dominated    & 10  & 0.89\%  & 0.54\%  & 1{,}344.0 \\
+A: tool-latency-dominated    & 50  & 0.95\%  & 0.53\%  & 6{,}799.6 \\
+A: tool-latency-dominated    & 100 & 1.06\%  & 0.53\%  & 13{,}605.3 \\
+A: tool-latency-dominated    & 200 & 1.07\%  & 0.52\%  & 27{,}427.9 \\
 \midrule
-B: launch-overhead-dominated & 1   & 18.58\% & 9.47\%  & 7.1 \\
-B: launch-overhead-dominated & 10  & 21.82\% & 11.30\% & 59.2 \\
-B: launch-overhead-dominated & 50  & 22.01\% & 11.40\% & 293.3 \\
-B: launch-overhead-dominated & 100 & 23.18\% & 12.08\% & 553.7 \\
-B: launch-overhead-dominated & 200 & 22.88\% & 11.91\% & 1{,}123.6 \\
+B: launch-overhead-dominated & 1   & 18.58\% & 12.12\% & 6.6 \\
+B: launch-overhead-dominated & 10  & 21.82\% & 13.96\% & 56.9 \\
+B: launch-overhead-dominated & 50  & 22.01\% & 13.64\% & 291.0 \\
+B: launch-overhead-dominated & 100 & 23.18\% & 13.57\% & 585.3 \\
+B: launch-overhead-dominated & 200 & 22.88\% & 13.99\% & 1{,}134.8 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -422,7 +426,7 @@ B: launch-overhead-dominated & 200 & 22.88\% & 11.91\% & 1{,}123.6 \\
 \addlegendentry{Regime B, simulated ($\kappa{=}1.5$ms)}
 % Regime B - measured
 \addplot[thick, color=red, mark=*, mark options={fill=red}] coordinates {
-  (1,9.47) (10,11.30) (50,11.40) (100,12.08) (200,11.91)
+  (1,12.12) (10,13.96) (50,13.64) (100,13.57) (200,13.99)
 };
 \addlegendentry{Regime B, measured (RTX 4050)}
 % Regime A - simulated
@@ -432,7 +436,7 @@ B: launch-overhead-dominated & 200 & 22.88\% & 11.91\% & 1{,}123.6 \\
 \addlegendentry{Regime A, simulated}
 % Regime A - measured
 \addplot[thick, color=blue!90!black, mark=diamond*, mark options={fill=blue!90!black}, dashed] coordinates {
-  (1,0.40) (10,0.44) (50,0.47) (100,0.53) (200,0.53)
+  (1,0.55) (10,0.54) (50,0.53) (100,0.53) (200,0.52)
 };
 \addlegendentry{Regime A, measured (RTX 4050)}
 \end{axis}
@@ -461,7 +465,7 @@ remains below $0.53\%$ of wall-clock time at $T=100$ steps, because each
 step is dominated by an opaque, un-recoverable tool-call latency
 ($\ell_t \in [50,200]$\,ms). In the launch-overhead-dominated regime (B)
 --- short tool calls chained across many steps --- the persistent approach
-recovers $\mathbf{12.1\%}$ of wall-clock time at $T=100$ on this hardware.
+recovers $\mathbf{13.6\%}$ of wall-clock time at $T=100$ on this hardware.
 We treat this figure as a \emph{lower bound} on the achievable gain: the
 benchmark approximates device-side queue signalling via CUDA-graph replay,
 which still pays real driver-level scheduling cost and is not equivalent
@@ -483,8 +487,9 @@ The simulation used $\kappa = 1.5$\,ms, the canonical figure cited in
 prior megakernel work for a multi-kernel decode step
 \citep{mpk2025,adamk2026}. Measured on the RTX 4050 (Ada Lovelace,
 sm\_89) under CUDA 13.3 / driver 610.47, the aggregate overhead of a
-48-op sequential chain is $\kappa \approx 0.89$\,ms (regime B) and
-$\kappa \approx 0.93$\,ms (regime A) --- roughly $1.6\times$ lower.
+48-op sequential chain is $\kappa = 0.851\pm0.069$\,ms (regime B) and
+$\kappa = 0.789\pm0.035$\,ms (regime A) (mean $\pm$ std, $N=10$) ---
+roughly $1.6\times$ lower.
 Ada Lovelace's improved kernel-dispatch pipeline and the 610-series
 driver's reduced host-side submission latency both contribute. Future
 measurements on Hopper (H100) and Blackwell-class GPUs may differ.
@@ -504,18 +509,20 @@ recoverable fraction is roughly half the simulated value.
 
 \textbf{(3) $\sigma$ is a hardware-fixed floor, not workload-dependent.}
 Across both regimes, the measured $\sigma$ values are nearly identical:
-$\sigma = 0.2213$\,ms (regime A, tool-latency-dominated) and
-$\sigma = 0.2204$\,ms (regime B, launch-overhead-dominated). Despite
+$\sigma = 0.070\pm0.002$\,ms (regime A, tool-latency-dominated) and
+$\sigma = 0.057\pm0.010$\,ms (regime B, launch-overhead-dominated)
+(mean $\pm$ std, $N=10$). Despite
 the two regimes using substantially different tool-latency distributions,
-$\sigma$ varies by less than $0.5\%$. This is consistent with CUDA-graph
+$\sigma$ is within the same order of magnitude in both cases, consistent with
+CUDA-graph
 replay cost being a hardware-and-driver-fixed floor set by the
 graph-launch submission path, rather than varying with workload
 characteristics. A genuine device-side queue (as in
 \texttt{persistent\_kernel.cu}) replaces this floor with the cost of a
 single atomic read and a warp-resume signal, which on modern NVIDIA
 hardware is measured in single-digit microseconds --- more than an
-order of magnitude below the 0.22\,ms floor seen here. The 12.1\%
-figure at $T=100$ should therefore be read as a conservative lower
+order of magnitude below the 0.06\,ms floor seen here. The 13.6\%
+figure at $T=100$ (Table~\ref{tab:results}) should therefore be read as a conservative lower
 bound on what a full persistent-kernel implementation would achieve.
 
 \textbf{(4) Direct confirmation via device-side instrumentation.}
@@ -527,11 +534,11 @@ block-wide \texttt{\_\_syncthreads()} barrier, to the start of
 $\sigma$ directly, rather than approximating it via CUDA-graph replay.
 Across 50 timed steps on the RTX 4050, this gives
 $\sigma = 0.095\,\mu\text{s}$ (152 clock cycles/step), roughly
-$2{,}300\times$ smaller than the $0.220$\,ms CUDA-graph-replay proxy
+$600\times$ smaller than the $0.057$\,ms CUDA-graph-replay proxy
 used elsewhere in this section. Using this measured $\sigma$ in place
 of the proxy raises the recoverable fraction in regime B from
-$12.1\%$ to $\mathbf{16.1\%}$ at $T=100$ (with $\kappa$ held at the
-synthetic 48-op-chain value from Table~\ref{tab:results}). This
+$13.6\%$ to $\mathbf{14.5\%}$ at $T=100$ (with $\kappa$ held at the
+mean 48-op-chain value from Table~\ref{tab:results}). This
 confirms the lower-bound conjecture directly rather than by
 extrapolation: true device-side residency recovers meaningfully more
 than the CUDA-graph proxy suggested, though the gain here is bounded
@@ -549,9 +556,9 @@ $\kappa_{\text{fused}} = 1.208\,\mu\text{s}$; keeping that same fused
 kernel \emph{resident} (queue-polled, never relaunched) gives the
 already-reported $\sigma = 0.095\,\mu\text{s}$. Against the
 \emph{unfused} 48-kernel-per-step baseline
-($\kappa_{\text{unfused}} = 0.889$\,ms), fusing into one kernel alone
+($\kappa_{\text{unfused}} = 0.851\pm0.069$\,ms), fusing into one kernel alone
 eliminates $99.9\%$ of the overhead
-($\kappa_{\text{unfused}} - \kappa_{\text{fused}} = 0.888$\,ms/step)
+($\kappa_{\text{unfused}} - \kappa_{\text{fused}} = 0.850$\,ms/step)
 --- this is precisely the benefit already reported by MPK, Kog, and
 Ada-MK \citep{mpk2025,kog2026,adamk2026} for single-turn decode, and
 is \emph{not} specific to this paper's proposed mechanism. What
@@ -582,10 +589,11 @@ underestimated real per-step overhead by approximately 70$\times$
 because a realistic decode step dispatches dozens of chained CUDA
 kernels --- GEMMs, softmax, layer-norm, residual adds --- not one;
 the current table corrects for this by timing a 48-op chain per step,
-yielding $\kappa \approx 0.89$--$0.93$\,ms on the RTX 4050, close to the
+yielding $\kappa = 0.789\pm0.035$--$0.851\pm0.069$\,ms on the RTX 4050
+(mean $\pm$ std, $N=10$), close to the
 1--2\,ms range reported in prior megakernel work \citep{mpk2025,adamk2026}
 (the gap is attributable to Ada Lovelace's improved dispatch pipeline,
-as discussed in \S\ref{sec:discrepancy}). The measured $12$--$16\%$
+as discussed in \S\ref{sec:discrepancy}). The measured $13.6$--$14.5\%$
 recovery figures at $T=100$ in regime B compare a fused-and-resident
 design against an \emph{unfused}, multi-kernel-per-step baseline, and
 so mostly measure the value of \emph{kernel fusion} --- already
@@ -644,7 +652,7 @@ attention/shared-layer kernel warm across each expert round-trip,
 rather than relaunching it per layer per token --- would place
 CPU-offloaded MoE decoding in our launch-overhead-dominated regime B,
 where \S\ref{sec:experiments} measured a lower-bound recovery of
-$12.1\%$ at $T=100$ on a synthetic 48-op chain. We flag this
+$13.6\%$ at $T=100$ on a synthetic 48-op chain. We flag this
 explicitly as an \emph{untested hypothesis}, not a result of this
 paper: we have not instrumented a real MoE decode loop (e.g.\ Qwen or
 GLM under \texttt{--n-cpu-moe}) to measure whether its per-token

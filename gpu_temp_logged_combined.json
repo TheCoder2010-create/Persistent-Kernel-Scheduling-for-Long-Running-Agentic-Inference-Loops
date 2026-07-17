@@ -1,0 +1,303 @@
+{
+  "description": "GPU temperature and clock measurements for 10 independent runs of each benchmark",
+  "clock_source": "nvidia-smi --query-gpu=temperature.gpu,clocks.sm",
+  "clock_rate_rated_khz": 1605000,
+  "clock_boost_observed_max_mhz": 2520,
+  "48op_chain_10_runs": [
+    {
+      "run": 0,
+      "temp_before": 60,
+      "temp_after": 61,
+      "sm_before": 1605,
+      "sm_after": 2520,
+      "elapsed_s": 4,
+      "kappa_ms_A": 0.44433,
+      "sigma_ms_A": 0.06055,
+      "kappa_ms_B": 0.51178,
+      "sigma_ms_B": 0.05081
+    },
+    {
+      "run": 1,
+      "temp_before": 61,
+      "temp_after": 61,
+      "sm_before": 2520,
+      "sm_after": 2520,
+      "elapsed_s": 6,
+      "kappa_ms_A": 0.60094,
+      "sigma_ms_A": 0.06871,
+      "kappa_ms_B": 0.66812,
+      "sigma_ms_B": 0.0524
+    },
+    {
+      "run": 2,
+      "temp_before": 61,
+      "temp_after": 61,
+      "sm_before": 2520,
+      "sm_after": 2520,
+      "elapsed_s": 4,
+      "kappa_ms_A": 0.47941,
+      "sigma_ms_A": 0.06229,
+      "kappa_ms_B": 0.51936,
+      "sigma_ms_B": 0.05874
+    },
+    {
+      "run": 3,
+      "temp_before": 61,
+      "temp_after": 59,
+      "sm_before": 2520,
+      "sm_after": 1605,
+      "elapsed_s": 9,
+      "kappa_ms_A": 0.69588,
+      "sigma_ms_A": 0.07054,
+      "kappa_ms_B": 1.86643,
+      "sigma_ms_B": 0.06963
+    },
+    {
+      "run": 4,
+      "temp_before": 59,
+      "temp_after": 58,
+      "sm_before": 1740,
+      "sm_after": 1605,
+      "elapsed_s": 11,
+      "kappa_ms_A": 1.05711,
+      "sigma_ms_A": 0.08004,
+      "kappa_ms_B": 2.60554,
+      "sigma_ms_B": 0.06682
+    },
+    {
+      "run": 5,
+      "temp_before": 58,
+      "temp_after": 59,
+      "sm_before": 1605,
+      "sm_after": 1605,
+      "elapsed_s": 14,
+      "kappa_ms_A": 1.727,
+      "sigma_ms_A": 0.07573,
+      "kappa_ms_B": 2.80131,
+      "sigma_ms_B": 0.08377
+    },
+    {
+      "run": 6,
+      "temp_before": 59,
+      "temp_after": 58,
+      "sm_before": 1605,
+      "sm_after": 2175,
+      "elapsed_s": 17,
+      "kappa_ms_A": 1.89754,
+      "sigma_ms_A": 0.08052,
+      "kappa_ms_B": 3.63339,
+      "sigma_ms_B": 0.08502
+    },
+    {
+      "run": 7,
+      "temp_before": 58,
+      "temp_after": 59,
+      "sm_before": 2175,
+      "sm_after": 2070,
+      "elapsed_s": 19,
+      "kappa_ms_A": 2.09299,
+      "sigma_ms_A": 0.09368,
+      "kappa_ms_B": 4.16474,
+      "sigma_ms_B": 0.08487
+    },
+    {
+      "run": 8,
+      "temp_before": 59,
+      "temp_after": 59,
+      "sm_before": 2070,
+      "sm_after": 1605,
+      "elapsed_s": 19,
+      "kappa_ms_A": 2.27196,
+      "sigma_ms_A": 0.11426,
+      "kappa_ms_B": 2.86613,
+      "sigma_ms_B": 0.07116
+    },
+    {
+      "run": 9,
+      "temp_before": 59,
+      "temp_after": 59,
+      "sm_before": 1605,
+      "sm_after": 2520,
+      "elapsed_s": 15,
+      "kappa_ms_A": 1.81529,
+      "sigma_ms_A": 0.07519,
+      "kappa_ms_B": 2.86993,
+      "sigma_ms_B": 0.08671
+    }
+  ],
+  "persistent_kernel_10_runs": [
+    {
+      "run": 0,
+      "temp_before": 58,
+      "temp_after": 59,
+      "sm_before": 1605,
+      "sm_after": 2520,
+      "elapsed_s": 2,
+      "sigma_ms": 9.47e-05,
+      "kappa_ms": 0.0,
+      "clock64_compute_ms": 1.15775631,
+      "cuda_event_compute_ms": 0.79259133,
+      "naive_ms_per_step": 0.74782723
+    },
+    {
+      "run": 1,
+      "temp_before": 59,
+      "temp_after": 59,
+      "sm_before": 2520,
+      "sm_after": 2520,
+      "elapsed_s": 2,
+      "sigma_ms": 9.47e-05,
+      "kappa_ms": 0.20383745,
+      "clock64_compute_ms": 1.11339478,
+      "cuda_event_compute_ms": 0.72800255,
+      "naive_ms_per_step": 0.93184
+    },
+    {
+      "run": 2,
+      "temp_before": 59,
+      "temp_after": 58,
+      "sm_before": 2520,
+      "sm_after": 2475,
+      "elapsed_s": 2,
+      "sigma_ms": 9.47e-05,
+      "kappa_ms": 0.55547905,
+      "clock64_compute_ms": 1.09714593,
+      "cuda_event_compute_ms": 0.91723776,
+      "naive_ms_per_step": 1.47271681
+    },
+    {
+      "run": 3,
+      "temp_before": 58,
+      "temp_after": 58,
+      "sm_before": 2475,
+      "sm_after": 2520,
+      "elapsed_s": 2,
+      "sigma_ms": 9.47e-05,
+      "kappa_ms": 0.21084291,
+      "clock64_compute_ms": 1.11340947,
+      "cuda_event_compute_ms": 0.73062271,
+      "naive_ms_per_step": 0.94146562
+    },
+    {
+      "run": 4,
+      "temp_before": 58,
+      "temp_after": 59,
+      "sm_before": 2520,
+      "sm_after": 2520,
+      "elapsed_s": 2,
+      "sigma_ms": 9.47e-05,
+      "kappa_ms": 0.06520844,
+      "clock64_compute_ms": 1.12887829,
+      "cuda_event_compute_ms": 1.25636601,
+      "naive_ms_per_step": 1.32157445
+    },
+    {
+      "run": 5,
+      "temp_before": 59,
+      "temp_after": 59,
+      "sm_before": 2520,
+      "sm_after": 2520,
+      "elapsed_s": 2,
+      "sigma_ms": 9.47e-05,
+      "kappa_ms": 0.05615616,
+      "clock64_compute_ms": 1.12456157,
+      "cuda_event_compute_ms": 0.74827772,
+      "naive_ms_per_step": 0.80443388
+    },
+    {
+      "run": 6,
+      "temp_before": 58,
+      "temp_after": 58,
+      "sm_before": 2505,
+      "sm_after": 2520,
+      "elapsed_s": 2,
+      "sigma_ms": 9.47e-05,
+      "kappa_ms": 0.0,
+      "clock64_compute_ms": 1.14388916,
+      "cuda_event_compute_ms": 0.91385859,
+      "naive_ms_per_step": 0.78306943
+    },
+    {
+      "run": 7,
+      "temp_before": 58,
+      "temp_after": 58,
+      "sm_before": 2520,
+      "sm_after": 2520,
+      "elapsed_s": 2,
+      "sigma_ms": 9.47e-05,
+      "kappa_ms": 0.05748791,
+      "clock64_compute_ms": 1.12124699,
+      "cuda_event_compute_ms": 0.73863107,
+      "naive_ms_per_step": 0.79611897
+    },
+    {
+      "run": 8,
+      "temp_before": 58,
+      "temp_after": 58,
+      "sm_before": 2520,
+      "sm_after": 2520,
+      "elapsed_s": 2,
+      "sigma_ms": 9.47e-05,
+      "kappa_ms": 0.0,
+      "clock64_compute_ms": 1.12264293,
+      "cuda_event_compute_ms": 1.0348953,
+      "naive_ms_per_step": 0.74692291
+    },
+    {
+      "run": 9,
+      "temp_before": 58,
+      "temp_after": 58,
+      "sm_before": 2520,
+      "sm_after": 2520,
+      "elapsed_s": 2,
+      "sigma_ms": 9.47e-05,
+      "kappa_ms": 0.0,
+      "clock64_compute_ms": 1.09294464,
+      "cuda_event_compute_ms": 0.88166273,
+      "naive_ms_per_step": 0.74119169
+    }
+  ],
+  "summary": {
+    "48op_chain": {
+      "regime_A": {
+        "kappa_ms": {
+          "mean": 1.308245,
+          "std": 0.722338
+        },
+        "sigma_ms": {
+          "mean": 0.078151,
+          "std": 0.015907
+        }
+      },
+      "regime_B": {
+        "kappa_ms": {
+          "mean": 2.250673,
+          "std": 1.309804
+        },
+        "sigma_ms": {
+          "mean": 0.070993,
+          "std": 0.013833
+        }
+      },
+      "temp_range_before": [
+        58,
+        61
+      ],
+      "sm_clock_range_mhz_before": [
+        1605,
+        2520
+      ]
+    },
+    "persistent_kernel": {
+      "sigma_ms": {
+        "mean": 9.47e-05,
+        "std": 0.0,
+        "note": "identical across all 10 runs (measured in clock64 cycles)"
+      },
+      "kappa_ms": {
+        "mean": 0.11490119,
+        "std": 0.17424411
+      }
+    }
+  }
+}
