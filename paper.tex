@@ -315,7 +315,7 @@ yields its SMs (dashed path) and re-acquires them once a new
   \If{no new entry in $Q$ within poll window $w$}
     \State \textbf{Device:} yield SMs (cooperative release)
   \EndIf
-  \State \textbf{Host:} on tool completion, re-encode result, go to line 3
+  \State \textbf{Host:} on tool completion, re-encode result and continue loop
 \EndFor
 \State \textbf{Device:} $K$ exits on host-issued shutdown signal
 \end{algorithmic}
@@ -386,8 +386,10 @@ are reported as mean $\pm$ standard deviation across $N=10$
 independent process launches. Regime~A: $\kappa=0.789\pm0.035$\,ms,
 $\sigma=0.070\pm0.002$\,ms. Regime~B: $\kappa=0.851\pm0.069$\,ms,
 $\sigma=0.057\pm0.010$\,ms. Both measured via CUDA events over a
-48-op chain per step, with cost-model rows (right three columns)
-computed at seed=0 using the mean $\kappa,\sigma$ values.}
+48-op chain per step, with cost-model rows (rightmost two columns)
+computed at seed=0 using the measured mean $\kappa,\sigma$ values
+(the Simulated column uses the canonical $\kappa=1.5$\,ms,
+$\sigma=\kappa/20$ constants as described above).}
 \label{tab:results}
 \begin{tabular}{llccc}
 \toprule
@@ -596,7 +598,7 @@ throughout this paper.}
 
 The marginal benefit of this paper's specific mechanism --- keeping an
 already-fused kernel resident rather than relaunching it per step ---
-is therefore $\kappa_{\text{fused}} - \sigma = 5.6$--$6.1\,\mu\text{s}$
+is therefore $\kappa_{\text{fused}} - \sigma = 5.5$--$6.0\,\mu\text{s}$
 per step ($\pm 1\sigma$). Against the \emph{unfused} 48-kernel-per-step baseline
 ($\kappa_{\text{unfused}} = 0.851\pm0.069$\,ms, $N=10$), fusing into
 one kernel alone eliminates over $98\%$ of the overhead
@@ -605,9 +607,9 @@ one kernel alone eliminates over $98\%$ of the overhead
 Ada-MK \citep{mpk2025,kog2026,adamk2026} for single-turn decode, and
 is \emph{not} specific to this paper's proposed mechanism. The
 residency benefit beyond fusion, at its upper bound of
-$6.1\,\mu\text{s}$/step, is $0.012\%$ of a full decode-plus-tool-call
+$6.0\,\mu\text{s}$/step, is $0.012\%$ of a full decode-plus-tool-call
 step ($d_t + \ell_t$, $\ell_t \geq 50$\,ms); as a fraction of compute
-time alone it is $0.83\%$, included only for readers accustomed to
+time alone ($d_t$) it is $0.82\%$, included only for readers accustomed to
 GPU-only timing. Both figures are negligible compared with tool-call
 latency ($\ell_t \sim \mathcal{U}(50,200)$\,ms). The $13.6$--$14.5\%$ recovery
 figures reported earlier in this section therefore over-attribute
@@ -643,11 +645,11 @@ established by MPK, Kog, and Ada-MK \citep{mpk2025,kog2026,adamk2026}
 device-side measurement of the fused-kernel launch overhead via a
 noop-kernel proxy (\S\ref{sec:discrepancy}, point 5) isolates the
 marginal contribution of residency \emph{beyond} fusion:
-$\kappa_{\text{fused}} - \sigma = 5.6$--$6.1\,\mu\text{s}$/step
+$\kappa_{\text{fused}} - \sigma = 5.5$--$6.0\,\mu\text{s}$/step
 ($N=10$, per-launch median $= 5.82 \pm 0.27\,\mu\text{s}$; see
 \S\ref{sec:discrepancy} for methodology), $0.012\%$ of a full
 decode-plus-tool-call step ($d_t + \ell_t$, $\ell_t \geq 50$\,ms);
-as a fraction of compute time alone it is $0.83\%$. We report this explicitly rather than let the
+as a fraction of compute time alone ($d_t$) it is $0.82\%$. We report this explicitly rather than let the
 larger, fusion-driven figure stand as if it were evidence for the
 paper's contribution: on current hardware and at this model scale,
 persistent residency's benefit \emph{beyond} an already-fused kernel
@@ -718,7 +720,6 @@ host-queue/resident-kernel design to close the gap, and release a
 reference implementation and benchmarking harness so the cost model
 can be validated empirically on real hardware rather than asserted.
 
-\bibliographystyle{plainnat}
 \begin{thebibliography}{9}
 
 \bibitem[Mirage Persistent Kernel, 2025]{mpk2025}
