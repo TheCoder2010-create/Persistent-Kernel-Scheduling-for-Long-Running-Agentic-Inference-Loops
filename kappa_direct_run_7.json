@@ -1,0 +1,42 @@
+{
+  "device": "NVIDIA GeForce RTX 4050 Laptop GPU",
+  "sm": "89",
+  "clock_rate_khz": 1605000,
+  "model": {"n_layers": 2, "dim": 256, "n_heads": 4, "ffn_dim": 1024},
+  "n_warmup_batches": 3,
+  "n_warmup_per_batch": 500,
+  "n_loop_launches": 500,
+  "n_per_launch": 100,
+  "real_loop_total_ms": 394.54003906,
+  "real_per_step_ms": 0.78908008,
+  "noop_loop_total_ms": 6.97855997,
+  "noop_per_step_ms": 0.01395712,
+  "kappa_fused_ms": 0.01395712,
+  "kappa_fused_us": 13.9571,
+  "kappa_source": "noop_loop_single_event_pair_div_N",
+  "compute_cuda_event_ms": 0.77512296,
+  "compute_cuda_event_source": "real_per_step_minus_kappa",
+  "clock64_compute_cycles_per_step": 1922384,
+  "clock64_compute_ms_at_base_clock": 1.19774691,
+  "clock64_n_timed_steps": 100,
+  "per_launch_real_ms": {
+    "median": 0.71526402,
+    "mean": 0.75652033,
+    "std": 0.14830196,
+    "p25": 0.70656002,
+    "p75": 0.72499198,
+    "min": 0.69734401,
+    "max": 1.52678394,
+    "unit": "ms"
+  },
+  "per_launch_noop_ms": {
+    "median": 0.08192000,
+    "mean": 0.07188000,
+    "std": 0.03656504,
+    "p25": 0.05324800,
+    "p75": 0.08396800,
+    "min": 0.00409600,
+    "max": 0.21728000,
+    "unit": "ms"
+  }
+}

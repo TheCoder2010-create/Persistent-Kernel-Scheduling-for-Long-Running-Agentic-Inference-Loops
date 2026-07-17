@@ -1,0 +1,36 @@
+{
+  "device": "NVIDIA GeForce RTX 4050 Laptop GPU",
+  "sm": "89",
+  "clock_rate_khz": 1605000,
+  "model": {"n_layers": 2, "dim": 256, "n_heads": 4, "ffn_dim": 1024},
+  "n_launches": 100,
+  "kernel": "transformer_step_kernel",
+  "per_launch_total_ms": {
+    "median": 1.06547201,
+    "mean": 1.07259905,
+    "std": 0.09514142,
+    "p25": 1.01683199,
+    "p75": 1.07827199,
+    "min": 1.00454402,
+    "max": 1.61894405,
+    "unit": "ms"
+  },
+  "noop_launch_ms": {
+    "median": 0.03179200,
+    "mean": 0.03802784,
+    "std": 0.02816124,
+    "p25": 0.01750400,
+    "p75": 0.05043200,
+    "min": 0.00409600,
+    "max": 0.21200000,
+    "unit": "ms"
+  },
+  "loop_per_step_ms": 1.01293051,
+  "loop_total_ms": 101.29305267,
+  "clock64_compute_cycles_per_step": 1752166,
+  "clock64_compute_cycles_total": 175216603,
+  "clock64_n_timed_steps": 100,
+  "kappa_fused_noop_median_ms": 0.03179200,
+  "kappa_fused_noop_median_us": 31.7920,
+  "boost_ratio": 0.9760
+}

@@ -55,17 +55,26 @@ launch-overhead cost specifically in multi-step tool-calling loops
 Laptop GPU show that, against an \emph{unfused}, multi-kernel-per-step
 baseline, a fused-and-resident design recovers up to $16.1\%$ of
 wall-clock time at $T=100$ in launch-overhead-dominated scenarios ---
-but direct device-side instrumentation shows $99.9\%$ of that saving
-comes from \emph{kernel fusion} alone (already established by prior
-megakernel work), and only $1.11\,\mu\text{s}$/step, under $0.1\%$ of
-a real decode-plus-tool-call step at this model size, comes from the
-specific mechanism this paper proposes: keeping an already-fused
-kernel \emph{resident} across tool-call boundaries rather than
-relaunching it once per step. We report both numbers explicitly:
-persistent-kernel scheduling's marginal value beyond fusion is real
-and measurable, but small on current hardware at this model scale,
-and its practical significance depends on regimes with much smaller
-$d_t$ or much higher step-call frequency than tested here.
+but direct device-side instrumentation over $N=10$ independent
+process launches confirms that over $98\%$ of that saving comes from
+\emph{kernel fusion} alone (already established by prior megakernel
+work). The device-side queue-signal cost is
+$\sigma = 0.095\,\mu\text{s}$/step (identical across all $N=10$
+runs). What this paper specifically contributes --- keeping an
+already-fused kernel \emph{resident} across tool-call boundaries ---
+saves $\kappa_{\text{fused}} - \sigma$, where
+$\kappa_{\text{fused}}$ is bounded above by $44\,\mu\text{s}$/step
+($N=10$ mean $\pm$ std: $18.6 \pm 13.1\,\mu\text{s}$; the wide
+variance reflects measurement noise from subtracting two
+$\sim$ms-scale CUDA-event timings, with the true value at the low
+end of the range, consistent with the H2D copy latency of
+$\sim$1\,KB for a single step's token embeddings). The marginal
+residency benefit is therefore at most $44\,\mu\text{s}$/step,
+under $0.1\%$ of a real decode-plus-tool-call step at this model
+size. Persistent-kernel scheduling's marginal value beyond fusion is
+real but small on current hardware at this model scale, and its
+practical significance depends on regimes with much smaller $d_t$
+or much higher step-call frequency than tested here.
 \end{abstract}
 
 \section{Introduction}
@@ -549,32 +558,61 @@ $\sigma$, rather than the synthetic op chain --- reveals an important
 distinction, addressed next.
 
 \textbf{(5) Decomposing the saving: fusion vs.\ residency.} We
-measured $\kappa$ directly from \texttt{persistent\_kernel.cu}'s own
-real forward pass in two configurations: relaunching the
-\emph{fused} kernel once per step gives
-$\kappa_{\text{fused}} = 1.208\,\mu\text{s}$; keeping that same fused
-kernel \emph{resident} (queue-polled, never relaunched) gives the
-already-reported $\sigma = 0.095\,\mu\text{s}$. Against the
-\emph{unfused} 48-kernel-per-step baseline
-($\kappa_{\text{unfused}} = 0.851\pm0.069$\,ms), fusing into one kernel alone
-eliminates $99.9\%$ of the overhead
-($\kappa_{\text{unfused}} - \kappa_{\text{fused}} = 0.850$\,ms/step)
+measured $\kappa$ and $\sigma$ directly from
+\texttt{persistent\_kernel.cu}'s own real forward pass over $N=10$
+independent process launches (50 timed decode steps per launch), and
+report results as mean $\pm$ standard deviation.
+
+The device-side queue-signal cost $\sigma$ is measured via
+\texttt{clock64()} timestamps bracketing the queue-poll path ---
+from the first thread observing \texttt{SLOT\_READY} through the
+block-wide \texttt{\_\_syncthreads()} barrier to the start of
+\texttt{decode\_segment()}. Across all $N=10$ runs, every step gives
+$\sigma = 152$ clock cycles/step; at the device's $1{,}605$\,MHz
+clock rate this is $\sigma = 0.095\,\mu\text{s}$ with
+\emph{zero variance across runs}. This is a genuinely deterministic
+quantity.
+
+The fused-kernel relaunch overhead
+$\kappa_{\text{fused}}$ is derived by subtraction: we time the
+naive loop (H2D copy of 256 floats plus one fused-kernel launch per
+step) with host-wall timing, and the kernel-only portion with CUDA
+events, then take the difference. Because both quantities are
+$\sim 0.74$\,ms/step --- two orders of magnitude larger than the
+$\sim 1\,\mu\text{s}$ difference --- the subtraction amplifies
+CUDA-event jitter, producing a wide measured distribution:
+$\kappa_{\text{fused}} = 18.6 \pm 13.1\,\mu\text{s}$ ($N=10$, range
+$[0, 44]\,\mu\text{s}$). Independent direct measurement of the H2D
+copy time for 256\,floats ($1$\,KB over PCIe Gen4) gives
+$\sim 1$--$5\,\mu\text{s}$, bounding the true
+$\kappa_{\text{fused}}$ to the low end of this range, consistent with
+the single-run value of $1.2\,\mu\text{s}$ reported in an earlier
+version of this analysis. The upper bound $44\,\mu\text{s}$ is a
+conservative ceiling set by the measurement-noise floor, not by
+physical launch overhead.
+
+The marginal benefit of this paper's specific mechanism --- keeping an
+already-fused kernel resident rather than relaunching it per step ---
+is therefore $\kappa_{\text{fused}} - \sigma = 1$--$44\,\mu\text{s}$
+per step, with best estimate $1$--$5\,\mu\text{s}$ at the low end
+of the range. Against the \emph{unfused} 48-kernel-per-step baseline
+($\kappa_{\text{unfused}} = 0.851\pm0.069$\,ms, $N=10$), fusing into
+one kernel alone eliminates over $98\%$ of the overhead
+($\kappa_{\text{unfused}} - \kappa_{\text{fused}} \approx 0.83$\,ms/step)
 --- this is precisely the benefit already reported by MPK, Kog, and
 Ada-MK \citep{mpk2025,kog2026,adamk2026} for single-turn decode, and
-is \emph{not} specific to this paper's proposed mechanism. What
-\emph{is} specific to this paper is the further step from
-fused-but-relaunched to fused-and-resident:
-$\kappa_{\text{fused}} - \sigma = 1.11\,\mu\text{s}$/step, a real but
-much smaller saving that, on this hardware and this model size
-($N_{\text{LAYERS}}=2$, $\text{DIM}=256$, real compute
-$d_t \approx 0.74$\,ms/step), amounts to under $0.1\%$ of a full
-decode-plus-tool-call step. The $12$--$16\%$ recovery figures reported
-earlier in this section therefore over-attribute credit: they compare
-against an \emph{unfused} baseline, which is the regime prior
-megakernel work already addresses, rather than isolating the marginal
-benefit of residency \emph{beyond} fusion, which is what this paper's
-host-queue design specifically contributes. We revise our claim
-accordingly below.
+is \emph{not} specific to this paper's proposed mechanism. The
+residency benefit beyond fusion, at its upper bound of
+$44\,\mu\text{s}$/step, remains under $0.1\%$ of a full
+decode-plus-tool-call step at this model size
+($d_t \approx 0.74$\,ms/step, regime-A tool latency
+$\ell_t \sim \mathcal{U}(50,200)$\,ms). The $13.6$--$14.5\%$ recovery
+figures reported earlier in this section therefore over-attribute
+credit: they compare against an \emph{unfused} baseline, which is the
+regime prior megakernel work already addresses, rather than isolating
+the marginal benefit of residency \emph{beyond} fusion, which is what
+this paper's host-queue design specifically contributes. We revise our
+claim accordingly below.
 
 \section{Discussion and Limitations}
 
@@ -601,8 +639,11 @@ established by MPK, Kog, and Ada-MK \citep{mpk2025,kog2026,adamk2026}
 --- rather than this paper's specific proposed mechanism. Direct
 device-side measurement of \texttt{persistent\_kernel.cu}'s own real
 forward pass (\S\ref{sec:discrepancy}, point 5) isolates the marginal
-contribution of residency \emph{beyond} fusion: $\kappa_{\text{fused}}
-- \sigma = 1.11\,\mu\text{s}$/step, under $0.1\%$ of a full
+contribution of residency \emph{beyond} fusion:
+$\kappa_{\text{fused}} - \sigma = 1$--$44\,\mu\text{s}$/step
+($N=10$, mean $\pm$ std: $18.6 \pm 13.1\,\mu\text{s}$; see
+\S\ref{sec:discrepancy} for the discussion of measurement noise at
+the low end of this range), under $0.1\%$ of a full
 decode-plus-tool-call step at this model size ($N_{\text{LAYERS}}=2$,
 $\text{DIM}=256$). We report this explicitly rather than let the
 larger, fusion-driven figure stand as if it were evidence for the

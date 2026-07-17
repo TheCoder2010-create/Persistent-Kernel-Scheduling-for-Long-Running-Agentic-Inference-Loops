@@ -1,0 +1,178 @@
+{
+  "n_runs": 10,
+  "n_loop_launches": 500,
+  "n_per_launch": 100,
+  "device": "NVIDIA GeForce RTX 4050 Laptop GPU",
+  "sm": "89",
+  "clock_rate_khz": 1605000,
+  "model": {
+    "n_layers": 2,
+    "dim": 256,
+    "n_heads": 4,
+    "ffn_dim": 1024
+  },
+  "real_per_step_ms": {
+    "mean": 0.809621048,
+    "std": 0.011457436421136976,
+    "min": 0.78908008,
+    "max": 0.82904834,
+    "unit": "ms"
+  },
+  "noop_per_step_ms": {
+    "mean": 0.039817603,
+    "std": 0.04430443725905618,
+    "min": 0.01313178,
+    "max": 0.16322823,
+    "unit": "ms"
+  },
+  "kappa_fused_ms": {
+    "mean": 0.039817603,
+    "std": 0.04430443725905618,
+    "min": 0.01313178,
+    "max": 0.16322823,
+    "unit": "ms",
+    "measurement": "noop_loop_single_event_pair_div_N"
+  },
+  "kappa_fused_us": 39.817603,
+  "compute_from_real_minus_kappa_ms": {
+    "mean": 0.769803446,
+    "std": 0.03745407561726709,
+    "unit": "ms"
+  },
+  "clock64_compute_ms_at_base": {
+    "mean": 1.2198868319999998,
+    "std": 0.012099020151811909,
+    "unit": "ms"
+  },
+  "clock64_compute_cycles_per_step": {
+    "mean": 1957918.5,
+    "std": 19418.978839441243,
+    "unit": "cycles"
+  },
+  "per_launch_real_median_ms": {
+    "mean": 0.714854418,
+    "std": 0.0006293933531019267,
+    "min": 0.71372801,
+    "max": 0.71577603,
+    "unit": "ms"
+  },
+  "per_launch_noop_median_ms": {
+    "mean": 0.039572800000000005,
+    "std": 0.018119078396970294,
+    "min": 0.014288,
+    "max": 0.08192,
+    "unit": "ms"
+  },
+  "per_run_results": [
+    {
+      "run": 0,
+      "real_per_step_ms": 0.80821043,
+      "noop_per_step_ms": 0.04162106,
+      "kappa_fused_ms": 0.04162106,
+      "compute_cuda_event_ms": 0.76658938,
+      "clock64_cycles_per_step": 1949767,
+      "clock64_compute_ms_at_base": 1.21480823,
+      "real_per_launch_median_ms": 0.71424001,
+      "noop_per_launch_median_ms": 0.036864
+    },
+    {
+      "run": 1,
+      "real_per_step_ms": 0.82904834,
+      "noop_per_step_ms": 0.16322823,
+      "kappa_fused_ms": 0.16322823,
+      "compute_cuda_event_ms": 0.66582011,
+      "clock64_cycles_per_step": 1982669,
+      "clock64_compute_ms_at_base": 1.23530755,
+      "real_per_launch_median_ms": 0.71475202,
+      "noop_per_launch_median_ms": 0.033168
+    },
+    {
+      "run": 2,
+      "real_per_step_ms": 0.81411278,
+      "noop_per_step_ms": 0.02660557,
+      "kappa_fused_ms": 0.02660557,
+      "compute_cuda_event_ms": 0.78750721,
+      "clock64_cycles_per_step": 1969530,
+      "clock64_compute_ms_at_base": 1.22712133,
+      "real_per_launch_median_ms": 0.71526402,
+      "noop_per_launch_median_ms": 0.043056
+    },
+    {
+      "run": 3,
+      "real_per_step_ms": 0.81380552,
+      "noop_per_step_ms": 0.0195929,
+      "kappa_fused_ms": 0.0195929,
+      "compute_cuda_event_ms": 0.79421262,
+      "clock64_cycles_per_step": 1967733,
+      "clock64_compute_ms_at_base": 1.22600186,
+      "real_per_launch_median_ms": 0.71475202,
+      "noop_per_launch_median_ms": 0.014288
+    },
+    {
+      "run": 4,
+      "real_per_step_ms": 0.81510401,
+      "noop_per_step_ms": 0.02508365,
+      "kappa_fused_ms": 0.02508365,
+      "compute_cuda_event_ms": 0.79002036,
+      "clock64_cycles_per_step": 1970001,
+      "clock64_compute_ms_at_base": 1.22741514,
+      "real_per_launch_median_ms": 0.71577603,
+      "noop_per_launch_median_ms": 0.03072
+    },
+    {
+      "run": 5,
+      "real_per_step_ms": 0.81263208,
+      "noop_per_step_ms": 0.03309773,
+      "kappa_fused_ms": 0.03309773,
+      "compute_cuda_event_ms": 0.77953435,
+      "clock64_cycles_per_step": 1965468,
+      "clock64_compute_ms_at_base": 1.22459041,
+      "real_per_launch_median_ms": 0.71526402,
+      "noop_per_launch_median_ms": 0.045584
+    },
+    {
+      "run": 6,
+      "real_per_step_ms": 0.81712538,
+      "noop_per_step_ms": 0.03581562,
+      "kappa_fused_ms": 0.03581562,
+      "compute_cuda_event_ms": 0.78130976,
+      "clock64_cycles_per_step": 1974415,
+      "clock64_compute_ms_at_base": 1.23016486,
+      "real_per_launch_median_ms": 0.71372801,
+      "noop_per_launch_median_ms": 0.040336
+    },
+    {
+      "run": 7,
+      "real_per_step_ms": 0.78908008,
+      "noop_per_step_ms": 0.01395712,
+      "kappa_fused_ms": 0.01395712,
+      "compute_cuda_event_ms": 0.77512296,
+      "clock64_cycles_per_step": 1922384,
+      "clock64_compute_ms_at_base": 1.19774691,
+      "real_per_launch_median_ms": 0.71526402,
+      "noop_per_launch_median_ms": 0.08192
+    },
+    {
+      "run": 8,
+      "real_per_step_ms": 0.79945934,
+      "noop_per_step_ms": 0.02604237,
+      "kappa_fused_ms": 0.02604237,
+      "compute_cuda_event_ms": 0.77341697,
+      "clock64_cycles_per_step": 1938887,
+      "clock64_compute_ms_at_base": 1.20802942,
+      "real_per_launch_median_ms": 0.71424001,
+      "noop_per_launch_median_ms": 0.0472
+    },
+    {
+      "run": 9,
+      "real_per_step_ms": 0.79763252,
+      "noop_per_step_ms": 0.01313178,
+      "kappa_fused_ms": 0.01313178,
+      "compute_cuda_event_ms": 0.78450074,
+      "clock64_cycles_per_step": 1938331,
+      "clock64_compute_ms_at_base": 1.20768261,
+      "real_per_launch_median_ms": 0.71526402,
+      "noop_per_launch_median_ms": 0.022592
+    }
+  ]
+}
