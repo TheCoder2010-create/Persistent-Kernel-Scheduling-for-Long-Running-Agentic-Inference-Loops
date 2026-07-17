@@ -1,118 +1,190 @@
-# Persistent Kernel Scheduling for Long-Running Agentic Inference Loops
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="agent-loop-visual.svg">
+    <img src="agent-loop-visual.svg" width="100%" alt="Persistent Kernel Scheduling for Agent Loops">
+  </picture>
+</p>
 
-**Author:** Manav Sutar · Single Core Labs · Pune, India  
-**arXiv:** _[pending]_
+<p align="center">
+  <a href="paper.pdf"><img src="https://img.shields.io/badge/paper-PDF-ef4444?style=flat-square" alt="Paper PDF"></a>
+  <a href="paper.tex"><img src="https://img.shields.io/badge/source-LaTeX-3b82f6?style=flat-square" alt="LaTeX source"></a>
+  <a href="persistent_kernel.cu"><img src="https://img.shields.io/badge/CUDA-persistent__kernel.cu-10b981?style=flat-square" alt="CUDA kernel"></a>
+  <a href="benchmark.py"><img src="https://img.shields.io/badge/benchmark-Python-f59e0b?style=flat-square" alt="Benchmark harness"></a>
+  <img src="https://img.shields.io/badge/license-MIT-8b5cf6?style=flat-square" alt="License">
+</p>
 
-## What This Paper Does
+---
 
-Standard LLM inference restacks CUDA kernels at every model call. In agent
-loops (model → tool → model, repeated tens to hundreds of times), that
-overhead is paid on every iteration. This paper:
+## The Problem
 
-1. **Formalizes** a cost model separating launch overhead ($\kappa$) from
-   tool latency ($\ell_t$) and queue-signal cost ($\sigma$).
-2. **Implements** a persistent CUDA kernel (`persistent_kernel.cu`) with
-   device-side `clock64()` instrumentation that measures the true queue-signal
-   cost without relying on CUDA-graph replay proxies.
-3. **Decomposes** the saving into two parts:
-   - **Fusion** (already established by MPK, Kog, Ada-MK): eliminates 99.9%
-     of the unfused launch overhead.
-   - **Residency** (this paper's mechanism): eliminates the remaining
-     1.11 μs/step — real but small at this model scale.
+**Autonomous LLM agents run long iterative loops:**
 
-## Key Numbers (RTX 4050 Laptop GPU)
+```
+model call → tool call → model call → tool call → model call → ...
+```
 
-| Metric | Value | Source |
-|--------|-------|--------|
-| $\sigma$ (device-side queue signal) | **0.095 μs** (152 cycles) | `clock64()` in `persistent_kernel.cu` |
-| $\kappa$ (fused kernel, 1 launch) | 1.208 μs | CUDA-event timing, same forward pass |
-| $\kappa$ (unfused 48-kernel baseline) | 0.889 ms | `benchmark.py --mode gpu` |
-| Residency benefit beyond fusion ($\kappa_{\text{fused}} - \sigma$) | 1.11 μs/step | direct measurement |
-| Recovery at T=100, regime B (vs unfused) | 12.1–16.1% | cost model with measured $\kappa$, $\sigma$ |
+Each model call re-launches a full stack of CUDA kernels — attention, GEMMs,
+softmax, layer-norm, residual adds — even though the transformer weights and
+most on-GPU state persist across the entire loop. In a single 100-step agent
+trajectory, this means paying **kernel tear-down and re-launch overhead on
+every single step** while the GPU sits idle across externally-latent tool
+calls (APIs, databases, subprocesses).
 
-**Honest decomposition:** 99.9% of the headline "recovery" compares a fused
-kernel against an unfused baseline (prior art). The paper's specific marginal
-contribution — keeping an already-fused kernel resident rather than relaunching
-it — is 1.11 μs/step, under 0.1% of a full decode+tool-call step at this
-model size.
+Prior megakernel work (MPK, Kog, Ada-MK, Event Tensor) solves the
+per-operator launch problem for single-turn decode by fusing the entire
+forward pass into one resident kernel. **But no existing system addresses the
+distinct overhead structure at the tool-call boundary** — where the GPU must
+survive externally-latent, data-dependent gaps between decode segments.
 
-See `paper.pdf` for the full treatment, including an untested hypothesis
-applying the same cost model to CPU-offloaded MoE decoding (§6.2).
+---
+
+## What This Work Does
+
+### 1. A Cost Model for Agent Loops
+
+We formalize the agent-loop overhead with three parameters:
+
+| Symbol | Meaning |
+|--------|---------|
+| **κ** | Kernel launch/teardown overhead per step |
+| **σ** | Queue-signal cost (persistent design, per step) |
+| **ℓ_t** | Tool-call latency (API, DB, subprocess — opaque to GPU) |
+
+Total wall time under standard per-step launching:
+```
+T_naive      = Σ (d_t + κ + ℓ_t)
+```
+Under persistent scheduling with a host-managed work queue:
+```
+T_persistent = Σ (d_t + σ + ℓ_t)
+```
+Recoverable overhead: **Δ(T) = T · (κ − σ)**
+
+### 2. A Host-Queue / Resident-Kernel Design
+
+<p align="center">
+  <img src="agent-loop-visual.svg" width="90%" alt="Design overview">
+</p>
+
+A three-part architecture:
+- **Resident decode kernel** — launched once per agent session, not once per step
+- **Host-managed work queue** — tool results arrive as queue entries; the
+  kernel polls instead of relaunching
+- **Cooperative yield** — during idle tool windows, SMs release to the
+  scheduler for other tenants
+
+### 3. Reference Implementation
+
+Three artifacts in this repository:
+
+- **`persistent_kernel.cu`** — CUDA skeleton with device-side spin-queue,
+  clock64() instrumentation, and a decode-segment stub. Drop in a real
+  forward pass (CUTLASS, Mirage-compiled task graph) for production use.
+
+- **`triton_persistent_agent_kernel.py`** — Triton prototype for rapid
+  iteration before dropping to raw CUDA.
+
+- **`benchmark.py`** — Hardware-agnostic harness with simulation and GPU modes
+  that measures T_naive vs. T_persistent under the cost model.
+
+---
+
+## Key Results
+
+| Metric | Value |
+|--------|-------|
+| **σ** (device-side queue signal) | **0.095 μs** (152 clock cycles) |
+| **κ_fused** (fused kernel, single launch) | **5.82 ± 0.27 μs** |
+| **κ_unfused** (48-kernel-per-step baseline) | **0.851 ± 0.069 ms** |
+| **Fusion saving** (κ_unfused − κ_fused) | **99.3%** of unfused overhead |
+| **Residency saving** (κ_fused − σ) | **5.725 μs/step** |
+| **Recovery at T=100** (vs unfused baseline) | **13.6–14.5%** |
+
+### Honest Decomposition
+
+Over **98%** of the headline recovery comes from **kernel fusion** — a benefit
+already established by MPK, Kog, and Ada-MK for single-turn decode.
+
+This paper's specific contribution — **keeping an already-fused kernel
+resident across tool-call boundaries** — saves the remaining **5.7 μs/step**.
+At this model scale, that is 0.011% of a full decode-plus-tool-call step
+(where tool latency ≥ 50 ms).
+
+> Persistent-kernel scheduling's marginal value beyond fusion is real but
+> small on current hardware at this scale. Its practical significance
+> depends on regimes with much smaller decode times or much higher step
+> frequencies than tested here.
+
+---
 
 ## Repository Layout
 
 ```
 .
-├── paper.tex                          # Main paper (NeurIPS-style, self-contained)
+├── paper.tex                          # Main paper (self-contained, NeurIPS-style)
 ├── paper.pdf                          # Compiled paper
+├── agent-loop-visual.svg              # Architecture diagram
 ├── persistent_kernel.cu               # CUDA resident kernel with clock64 timing
 ├── triton_persistent_agent_kernel.py  # Triton / CUDA-graph prototype
 ├── benchmark.py                       # Benchmark harness (simulate + GPU modes)
-├── AUDIT.md                           # Repository audit + measurement verification
-├── sim_results.json                   # Simulated cost-model results (Table 1)
-├── gpu_results_device_sigma.json      # clock64 device-side σ (primary result)
-├── benchmarks/
-│   └── results/
-│       ├── gpu_results.json           # Single-op measurement (superseded)
-│       └── gpu_results_v2.json        # 48-op chain benchmark (Table 1 proxy)
-└── requirements.txt
+├── AUDIT.md                           # Measurement verification
+├── requirements.txt
+└── *.json                             # Raw measurement data (10 runs)
 ```
 
-## Build & Run
+---
 
-### CUDA resident kernel
+## Quick Start
 
-```bat
-call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-nvcc -O3 -arch=sm_89 persistent_kernel.cu -o persistent_kernel.exe
-persistent_kernel.exe --steps 20 --json-out gpu_results_device_sigma.json
-```
-
-Adjust `-arch` for your GPU: `sm_80` (A100), `sm_86` (RTX 30xx), `sm_89`
-(RTX 40xx Ada), `sm_90` (H100).
-
-### Benchmark harness
+### Run the Cost Model (CPU, no GPU needed)
 
 ```bash
-# CPU-only cost-model validation
 python benchmark.py --mode simulate --regime both
-
-# GPU measurement (48-op chain)
-python benchmark.py --mode gpu --regime both --json-out benchmarks/results/gpu_results.json
 ```
 
-### Paper
+### Build the CUDA Persistent Kernel
+
+```bash
+nvcc -O3 -arch=sm_XX persistent_kernel.cu -o persistent_kernel.exe
+persistent_kernel.exe --steps 20 --json-out results.json
+```
+
+Adjust `-arch=sm_XX` to match your GPU (`sm_80` A100, `sm_86` RTX 30xx,
+`sm_89` Ada, `sm_90` H100).
+
+### GPU Benchmark
+
+```bash
+python benchmark.py --mode gpu --regime both --ops-per-step 48
+```
+
+### Compile the Paper
 
 ```bash
 pdflatex -interaction=nonstopmode paper.tex
 pdflatex -interaction=nonstopmode paper.tex
 ```
+
+---
 
 ## Dependencies
 
-- CUDA Toolkit ≥ 12.x (for `persistent_kernel.cu`)
-- MSVC Build Tools 2022 (Windows) or GCC (Linux)
-- Python 3.10+ with: torch, numpy, matplotlib
-- LaTeX distribution with: amsmath, amssymb, geometry, times, booktabs,
-  algorithm, algpseudocode, url, caption, natbib, tikz, pgfplots
+| Tool | Required for |
+|------|-------------|
+| CUDA Toolkit ≥ 12.x | `persistent_kernel.cu` |
+| MSVC / GCC | CUDA compilation |
+| Python 3.10+ (torch, numpy, matplotlib) | `benchmark.py` |
+| LaTeX (amsmath, tikz, pgfplots, natbib) | Paper compilation |
 
-## Hardware Used
-
-| Component | Details |
-|-----------|---------|
-| GPU | NVIDIA GeForce RTX 4050 Laptop (sm_89, 6 GB) |
-| CUDA Toolkit | 13.3 (V13.3.73) |
-| Driver | 610.47 |
-| PyTorch | 2.11.0+cu128 |
-| OS | Windows 11 |
+---
 
 ## Citation
 
 ```bibtex
 @misc{sutar2026persistent,
   author = {Manav Sutar},
-  title  = {Persistent Kernel Scheduling for Long-Running Agentic Inference Loops},
-  year   = {2026},
-  note   = {arXiv preprint}
+  title  = {Persistent Kernel Scheduling for Long-Running
+            Agentic Inference Loops},
+  year   = {2026}
 }
 ```

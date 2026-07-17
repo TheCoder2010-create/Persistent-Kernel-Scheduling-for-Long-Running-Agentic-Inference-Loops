@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#6366f1"/>
+    </linearGradient>
+    <linearGradient id="grad2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#ef4444"/>
+    </linearGradient>
+    <linearGradient id="grad3" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#14b8a6"/>
+    </linearGradient>
+    <linearGradient id="grad4" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#94a3b8"/>
+    </marker>
+    <marker id="arrow-grad" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#3b82f6"/>
+    </marker>
+  </defs>
+
+  <rect width="800" height="500" fill="url(#bg)" rx="12"/>
+
+  <!-- Title -->
+  <text x="400" y="40" text-anchor="middle" fill="#f1f5f9" font-size="18" font-weight="700" filter="url(#glow)">Agent Inference Loop &mdash; The Problem</text>
+
+  <!-- Standard approach (top half) -->
+  <text x="30" y="75" fill="#94a3b8" font-size="12" font-weight="600" letter-spacing="1.5">STANDARD: KERNEL PER STEP</text>
+
+  <!-- Step boxes -->
+  <rect x="40" y="90" width="120" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="100" y="112" text-anchor="middle" fill="#3b82f6" font-size="11" font-weight="600">MODEL CALL</text>
+  <text x="100" y="128" text-anchor="middle" fill="#64748b" font-size="10">48+ kernel launches</text>
+
+  <rect x="200" y="90" width="120" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="260" y="112" text-anchor="middle" fill="#f59e0b" font-size="11" font-weight="600">TOOL CALL</text>
+  <text x="260" y="128" text-anchor="middle" fill="#64748b" font-size="10">API / DB / subprocess</text>
+
+  <rect x="360" y="90" width="120" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="420" y="112" text-anchor="middle" fill="#3b82f6" font-size="11" font-weight="600">MODEL CALL</text>
+  <text x="420" y="128" text-anchor="middle" fill="#64748b" font-size="10">48+ kernel launches</text>
+
+  <rect x="520" y="90" width="120" height="55" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1.5"/>
+  <text x="580" y="112" text-anchor="middle" fill="#f59e0b" font-size="11" font-weight="600">TOOL CALL</text>
+  <text x="580" y="128" text-anchor="middle" fill="#64748b" font-size="10">API / DB / subprocess</text>
+
+  <text x="680" y="120" text-anchor="middle" fill="#475569" font-size="20">...</text>
+
+  <!-- Launch overhead callouts -->
+  <rect x="45" y="148" width="110" height="18" rx="3" fill="#ef4444" fill-opacity="0.15" stroke="#ef4444" stroke-width="0.8" stroke-dasharray="3,2"/>
+  <text x="100" y="160" text-anchor="middle" fill="#ef4444" font-size="9">κ launch overhead</text>
+
+  <rect x="245" y="148" width="110" height="18" rx="3" fill="#ef4444" fill-opacity="0.15" stroke="#ef4444" stroke-width="0.8" stroke-dasharray="3,2"/>
+  <text x="300" y="160" text-anchor="middle" fill="#ef4444" font-size="9">κ launch overhead</text>
+
+  <rect x="365" y="148" width="110" height="18" rx="3" fill="#ef4444" fill-opacity="0.15" stroke="#ef4444" stroke-width="0.8" stroke-dasharray="3,2"/>
+  <text x="420" y="160" text-anchor="middle" fill="#ef4444" font-size="9">κ launch overhead</text>
+
+  <!-- Arrows between steps -->
+  <line x1="160" y1="117" x2="197" y2="117" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="320" y1="117" x2="357" y2="117" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="480" y1="117" x2="517" y2="117" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="640" y1="117" x2="673" y2="117" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Big red X showing relaunch -->
+  <text x="88" y="178" text-anchor="middle" fill="#ef4444" font-size="8" font-weight="600">Kernel stack torn down &amp; relaunched every step</text>
+
+  <!-- Divider -->
+  <line x1="30" y1="200" x2="770" y2="200" stroke="#334155" stroke-width="1"/>
+
+  <!-- Persistent approach (bottom half) -->
+  <text x="30" y="225" fill="#10b981" font-size="12" font-weight="600" letter-spacing="1.5">THIS WORK: PERSISTENT KERNEL SCHEDULING</text>
+
+  <!-- Single big persistent kernel box -->
+  <rect x="40" y="240" width="720" height="80" rx="10" fill="#0f172a" stroke="url(#grad3)" stroke-width="2"/>
+  <text x="400" y="265" text-anchor="middle" fill="#34d399" font-size="14" font-weight="700">RESIDENT KERNEL &mdash; Launched Once</text>
+
+  <!-- Inner steps within the persistent kernel -->
+  <rect x="60" y="278" width="100" height="35" rx="6" fill="#065f46" stroke="#34d399" stroke-width="0.8"/>
+  <text x="110" y="300" text-anchor="middle" fill="#6ee7b7" font-size="10">Decode d₁</text>
+
+  <rect x="180" y="278" width="100" height="35" rx="6" fill="#1e3a5f" stroke="#60a5fa" stroke-width="0.8"/>
+  <text x="230" y="300" text-anchor="middle" fill="#60a5fa" font-size="10">Queue poll (σ)</text>
+
+  <rect x="300" y="278" width="100" height="35" rx="6" fill="#065f46" stroke="#34d399" stroke-width="0.8"/>
+  <text x="350" y="300" text-anchor="middle" fill="#6ee7b7" font-size="10">Decode d₂</text>
+
+  <rect x="420" y="278" width="100" height="35" rx="6" fill="#1e3a5f" stroke="#60a5fa" stroke-width="0.8"/>
+  <text x="470" y="300" text-anchor="middle" fill="#60a5fa" font-size="10">Queue poll (σ)</text>
+
+  <rect x="540" y="278" width="100" height="35" rx="6" fill="#065f46" stroke="#34d399" stroke-width="0.8"/>
+  <text x="590" y="300" text-anchor="middle" fill="#6ee7b7" font-size="10">Decode d₃</text>
+
+  <text x="660" y="300" text-anchor="middle" fill="#475569" font-size="18">⋯</text>
+
+  <!-- Tool calls happening outside -->
+  <rect x="60" y="335" width="100" height="28" rx="5" fill="#451a03" stroke="#f59e0b" stroke-width="0.8"/>
+  <text x="110" y="353" text-anchor="middle" fill="#fbbf24" font-size="9">API call ℓ₁</text>
+
+  <rect x="300" y="335" width="100" height="28" rx="5" fill="#451a03" stroke="#f59e0b" stroke-width="0.8"/>
+  <text x="350" y="353" text-anchor="middle" fill="#fbbf24" font-size="9">DB query ℓ₂</text>
+
+  <rect x="540" y="335" width="100" height="28" rx="5" fill="#451a03" stroke="#f59e0b" stroke-width="0.8"/>
+  <text x="590" y="353" text-anchor="middle" fill="#fbbf24" font-size="9">subprocess ℓ₃</text>
+
+  <!-- Saving callout -->
+  <rect x="280" y="385" width="240" height="24" rx="6" fill="#10b981" fill-opacity="0.12" stroke="#10b981" stroke-width="1"/>
+  <text x="400" y="401" text-anchor="middle" fill="#34d399" font-size="11" font-weight="600">Saving: κ_fused &minus; σ = 5.7 &mu;s/step</text>
+
+  <!-- Better caption -->
+  <text x="400" y="460" text-anchor="middle" fill="#94a3b8" font-size="10">Kernel fusion alone (prior art) eliminates 99.3% of unfused overhead.</text>
+  <text x="400" y="478" text-anchor="middle" fill="#94a3b8" font-size="10">Residency (this work) eliminates the remaining 5.7 &mu;s/step.</text>
+</svg>
