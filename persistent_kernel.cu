@@ -1,17 +1,14 @@
-// persistent_kernel.cu
+// persistent_kernel.cu — Multi-Trajectory Persistent Agent Kernel
 //
-// Persistent kernel with REAL transformer decode
-// (LayerNorm -> MHA -> residual -> LayerNorm -> MLP -> residual) x N_LAYERS
-// for agent-loop inference. The kernel stays resident across tool-call
-// boundaries using a host-managed work queue.
+// Extends the original single-trajectory design to N concurrent trajectories
+// sharing one resident kernel.  Designed for the follow-up regime where
+// d_t + l_t is small (sub-ms) and N is large (up to 128), making the
+// amortized-launch saving (N-1)*kappa meaningful.
 //
-// Two modes:
-//   1. Persistent: launch once, queue-driven steps (no relaunch)
-//   2. Naive:      fresh kernel launch every step (baseline)
+// Design: design.md  |  Paper: paper.tex
 //
-// Build:
-//   nvcc -O3 -arch=sm_89 persistent_kernel.cu -o persistent_kernel
-//   (adjust -arch: sm_86 for RTX 30xx, sm_90 for H100, sm_89 for Ada Lovelace)
+// Build (RTX 4050 / sm_86):
+//   nvcc -O3 -arch=sm_86 persistent_kernel.cu -o persistent_kernel.exe
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -27,19 +24,20 @@
 #include <atomic>
 
 // ---------------------------------------------------------------------------
-// Configuration (matches benchmark.py --real-model defaults)
+// Configuration
 // ---------------------------------------------------------------------------
 #define DIM          256
 #define N_HEADS      4
-#define HEAD_DIM     (DIM / N_HEADS)   // 64
+#define HEAD_DIM     (DIM / N_HEADS)
 #define MLP_RATIO    4
-#define FFN_DIM      (DIM * MLP_RATIO) // 1024
+#define FFN_DIM      (DIM * MLP_RATIO)
 #define MAX_SEQ_LEN  512
 #define N_LAYERS     2
 #define EPS          1e-5f
+#define MAX_N_TRAJ   128
 
 // ---------------------------------------------------------------------------
-// Queue entry for agent-loop step
+// Queue
 // ---------------------------------------------------------------------------
 enum SlotState : int32_t {
     SLOT_EMPTY    = 0,
@@ -50,40 +48,24 @@ enum SlotState : int32_t {
 
 struct QueueEntry {
     int32_t state;
-    int32_t step_id;
-    int32_t seq_len;            // current KV cache length before this step
+    int32_t trajectory_id;     // which trajectory this slot belongs to
+    int32_t seq_len;           // KV cache length before this step
+    int32_t _pad;
     float   input[DIM];
     float   output[DIM];
 };
 
-// Device-side timing accumulators (clock64 cycles). Written by thread 0.
-struct KernelStats {
-    unsigned long long sigma_cycles_total;    // READY observed -> warps synced, pre-decode
-    unsigned long long compute_cycles_total;  // decode_segment wall (clock64)
+// Per-trajectory device-side timing (clock64 cycles)
+struct TrajStats {
+    unsigned long long sigma_cycles_total;
+    unsigned long long compute_cycles_total;
     int32_t            n_timed_steps;
     int32_t            _pad;
 };
 
-// Queue is allocated via cudaMalloc / mapped host memory and passed as a
-// kernel parameter (not a __device__ symbol) for host/device coherence.
-
 // ---------------------------------------------------------------------------
-// Weight layout helpers (all weights packed per-layer for coalesced access)
+// Weight layout (same as original, one shared set for all trajectories)
 // ---------------------------------------------------------------------------
-// Per-layer offset table (in float units):
-//   [0]  ln1_weight  DIM
-//   [1]  ln1_bias    DIM
-//   [2]  qkv_weight  DIM * 3*DIM
-//   [3]  qkv_bias    3*DIM
-//   [4]  attn_o_wt   DIM * DIM
-//   [5]  attn_o_bias DIM
-//   [6]  ln2_weight  DIM
-//   [7]  ln2_bias    DIM
-//   [8]  fc1_weight  DIM * FFN_DIM
-//   [9]  fc1_bias    FFN_DIM
-//   [10] fc2_weight  FFN_DIM * DIM
-//   [11] fc2_bias    DIM
-
 #define LAYER_FLOATS (2*DIM + DIM*3*DIM + 3*DIM + DIM*DIM + DIM + 2*DIM + DIM*FFN_DIM + FFN_DIM + FFN_DIM*DIM + DIM)
 
 __host__ __device__ inline int layer_offset(int layer) {
@@ -103,25 +85,27 @@ __host__ __device__ inline int off_fc1_b(int layer)  { return off_fc1_w(layer) +
 __host__ __device__ inline int off_fc2_w(int layer)  { return off_fc1_b(layer) + FFN_DIM; }
 __host__ __device__ inline int off_fc2_b(int layer)  { return off_fc2_w(layer) + FFN_DIM*DIM; }
 
-// KV cache layout: [layer][head][pos][dim]
-// K_cache[layer][head * MAX_SEQ_LEN * HEAD_DIM + pos * HEAD_DIM + d]
+// KV cache layout per trajectory:
+//   [layer * N_HEADS * MAX_SEQ_LEN * HEAD_DIM]
 #define KV_CACHE_LAYER_FLOATS (N_HEADS * MAX_SEQ_LEN * HEAD_DIM)
 
-__device__ inline int kv_cache_len_offset(int layer) {
-    return layer; // one int per layer
-}
+// Given trajectory t, layer l, head h, position pos, dimension d:
+//   traj_base = t * N_LAYERS * KV_CACHE_LAYER_FLOATS
+//   layer_base = traj_base + l * KV_CACHE_LAYER_FLOATS
+//   head_base = layer_base + h * MAX_SEQ_LEN * HEAD_DIM
+//   index = head_base + pos * HEAD_DIM + d
 
-__device__ inline int kv_cache_offset(int layer, int head, int pos, int d) {
-    return layer * KV_CACHE_LAYER_FLOATS + head * (MAX_SEQ_LEN * HEAD_DIM) + pos * HEAD_DIM + d;
+__host__ __device__ inline int kv_cache_flat_index(int traj, int layer,
+                                                     int head, int pos, int d) {
+    return (traj * N_LAYERS * KV_CACHE_LAYER_FLOATS)
+         + (layer * KV_CACHE_LAYER_FLOATS)
+         + (head * MAX_SEQ_LEN * HEAD_DIM)
+         + (pos * HEAD_DIM)
+         + d;
 }
-
-// Global memory pointers passed to kernel
-// We'll pack lengths in a separate int buffer
-// Weights: [N_LAYERS * LAYER_FLOATS]
-// KV cache: [N_LAYERS * N_HEADS * MAX_SEQ_LEN * HEAD_DIM]
 
 // ---------------------------------------------------------------------------
-// Host-side CUDA error checking
+// Error checking
 // ---------------------------------------------------------------------------
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -133,7 +117,7 @@ __device__ inline int kv_cache_offset(int layer, int head, int pos, int d) {
 } while(0)
 
 // ---------------------------------------------------------------------------
-// Device helper: GELU activation (tanh approximation)
+// Device helpers (unchanged from original)
 // ---------------------------------------------------------------------------
 __device__ inline float gelu_fwd(float x) {
     const float sqrt_2_over_pi = 0.7978845608028654f;
@@ -142,10 +126,6 @@ __device__ inline float gelu_fwd(float x) {
     return 0.5f * x * (1.0f + tanhf(inner));
 }
 
-// ---------------------------------------------------------------------------
-// Device helper: GEMV  y[M] = W[M,N] @ x[N] + bias[M]
-// Assumes all threads in block participate; use __syncthreads internally.
-// ---------------------------------------------------------------------------
 __device__ void gemv(float* y, const float* W, const float* x,
                      const float* bias, int M, int N) {
     int tid = threadIdx.x;
@@ -159,21 +139,14 @@ __device__ void gemv(float* y, const float* W, const float* x,
     __syncthreads();
 }
 
-// ---------------------------------------------------------------------------
-// Device helper: LayerNorm  x = (x - mean) / sqrt(var + eps) * w + b
-// ---------------------------------------------------------------------------
 __device__ void layer_norm(float* x, const float* w, const float* b,
                             int dim, float eps) {
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
 
-    // Sum
     float sum = 0.0f;
-    for (int i = tid; i < dim; i += nthreads) {
-        sum += x[i];
-    }
+    for (int i = tid; i < dim; i += nthreads) sum += x[i];
 
-    // Reduction
     __shared__ float sdata[256];
     sdata[tid] = sum;
     __syncthreads();
@@ -193,7 +166,6 @@ __device__ void layer_norm(float* x, const float* w, const float* b,
     __syncthreads();
     float mean = sdata[0] / dim;
 
-    // Variance
     float var_sum = 0.0f;
     for (int i = tid; i < dim; i += nthreads) {
         float d = x[i] - mean;
@@ -218,31 +190,21 @@ __device__ void layer_norm(float* x, const float* w, const float* b,
     float var = sdata[0] / dim;
     float inv_std = rsqrtf(var + eps);
 
-    // Normalize
     for (int i = tid; i < dim; i += nthreads) {
         x[i] = (x[i] - mean) * inv_std * w[i] + (b ? b[i] : 0.0f);
     }
     __syncthreads();
 }
 
-// ---------------------------------------------------------------------------
-// Device: Multi-head attention for ONE head (with KV cache update)
-// Processes head_idx, assumes Q/K/V for this head are already split out.
-// ---------------------------------------------------------------------------
 __device__ void attention_head(
-    const float* q_head,        // [HEAD_DIM]
-    const float* k_head,        // [HEAD_DIM]  (new K to append)
-    const float* v_head,        // [HEAD_DIM]  (new V to append)
-    float* k_cache_head,        // [MAX_SEQ_LEN * HEAD_DIM]
-    float* v_cache_head,        // [MAX_SEQ_LEN * HEAD_DIM]
-    int old_seq_len,            // length BEFORE this step
-    float* out_head             // [HEAD_DIM]  (output for this head)
+    const float* q_head, const float* k_head, const float* v_head,
+    float* k_cache_head, float* v_cache_head,
+    int old_seq_len, float* out_head
 ) {
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
     int new_len = old_seq_len + 1;
 
-    // Step 1: Append K, V to cache
     int write_pos = old_seq_len;
     for (int d = tid; d < HEAD_DIM; d += nthreads) {
         k_cache_head[write_pos * HEAD_DIM + d] = k_head[d];
@@ -250,9 +212,6 @@ __device__ void attention_head(
     }
     __syncthreads();
 
-    // Step 2: Compute attention scores Q @ K_cache^T / sqrt(d)
-    // scores[pos] = sum_d Q[d] * K_cache[pos][d]  for pos in 0..new_len-1
-    // Shared memory for scores (max 512 elements)
     __shared__ float scores[MAX_SEQ_LEN];
     for (int pos = tid; pos < new_len; pos += nthreads) {
         float s = 0.0f;
@@ -263,15 +222,11 @@ __device__ void attention_head(
     }
     __syncthreads();
 
-    // Step 3: Stable softmax over scores[0:new_len-1]
-    // Find max
     float my_max = -1e30f;
     for (int pos = tid; pos < new_len; pos += nthreads) {
         if (scores[pos] > my_max) my_max = scores[pos];
     }
-    // Reduction for max
-    __shared__ float smax;
-    __shared__ float ssum;
+    __shared__ float smax, ssum;
     {
         __shared__ float rbuf[256];
         rbuf[tid] = my_max;
@@ -293,15 +248,12 @@ __device__ void attention_head(
         __syncthreads();
     }
 
-    // Exp and sum
     float my_sum = 0.0f;
     for (int pos = tid; pos < new_len; pos += nthreads) {
         scores[pos] = expf(scores[pos] - smax);
         my_sum += scores[pos];
     }
     __syncthreads();
-
-    // Reduction for sum
     {
         __shared__ float rbuf[256];
         rbuf[tid] = my_sum;
@@ -323,14 +275,12 @@ __device__ void attention_head(
         __syncthreads();
     }
 
-    // Normalize scores
     float inv_sum = 1.0f / ssum;
     for (int pos = tid; pos < new_len; pos += nthreads) {
         scores[pos] *= inv_sum;
     }
     __syncthreads();
 
-    // Step 4: Weighted sum of V_cache: out_head[d] = sum_pos scores[pos] * V_cache[pos][d]
     for (int d = tid; d < HEAD_DIM; d += nthreads) {
         float acc = 0.0f;
         for (int pos = 0; pos < new_len; pos++) {
@@ -342,8 +292,7 @@ __device__ void attention_head(
 }
 
 // ---------------------------------------------------------------------------
-// Shared-memory workspace for one decode step (block-wide, not per-thread).
-// ~17 KB — fits comfortably in sm_89 shared memory.
+// Workspace (shared memory per block)
 // ---------------------------------------------------------------------------
 struct DecodeWorkspace {
     float h[DIM];
@@ -364,43 +313,33 @@ struct DecodeWorkspace {
 };
 
 // ---------------------------------------------------------------------------
-// Device: Full decode segment for one agent step
-// Runs the transformer forward pass, updates KV cache in-place.
+// Decode segment (same as original, operates on a trajectory's KV cache)
 // ---------------------------------------------------------------------------
 __device__ void decode_segment(
-    const float* input,   // [DIM] token embedding
-    float* output,        // [DIM] output logits
-    float* weights,       // [N_LAYERS * LAYER_FLOATS]
-    float* k_cache,       // [N_LAYERS * N_HEADS * MAX_SEQ_LEN * HEAD_DIM]
-    float* v_cache,       // [N_LAYERS * N_HEADS * MAX_SEQ_LEN * HEAD_DIM]
-    int* kv_len,          // [N_LAYERS] current lengths, updated in-place
-    DecodeWorkspace* ws   // block-shared working buffers
+    const float* input,
+    float* output,
+    const float* weights,
+    float* k_cache,       // base pointer for this trajectory's K cache
+    float* v_cache,       // base pointer for this trajectory's V cache
+    int* kv_len,          // [N_LAYERS] for this trajectory
+    DecodeWorkspace* ws
 ) {
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
-
     float* h = ws->h;
 
-    // Copy input to h
-    for (int i = tid; i < DIM; i += nthreads) {
-        h[i] = input[i];
-    }
+    for (int i = tid; i < DIM; i += nthreads) h[i] = input[i];
     __syncthreads();
 
     for (int layer = 0; layer < N_LAYERS; layer++) {
-        // --- Save residual ---
         for (int i = tid; i < DIM; i += nthreads) ws->residual[i] = h[i];
         __syncthreads();
 
-        // --- Pre-norm LayerNorm ---
         for (int i = tid; i < DIM; i += nthreads) ws->normed[i] = h[i];
         __syncthreads();
-        layer_norm(ws->normed,
-                   weights + off_ln1_w(layer),
-                   weights + off_ln1_b(layer),
-                   DIM, EPS);
+        layer_norm(ws->normed, weights + off_ln1_w(layer),
+                   weights + off_ln1_b(layer), DIM, EPS);
 
-        // --- QKV projections ---
         gemv(ws->qkv, weights + off_qkv_w(layer), ws->normed,
              weights + off_qkv_b(layer), 3 * DIM, DIM);
         for (int i = tid; i < DIM; i += nthreads) {
@@ -410,7 +349,6 @@ __device__ void decode_segment(
         }
         __syncthreads();
 
-        // --- Multi-head attention (process heads sequentially) ---
         for (int i = tid; i < DIM; i += nthreads) ws->attn_out[i] = 0.0f;
         __syncthreads();
 
@@ -418,7 +356,6 @@ __device__ void decode_segment(
 
         for (int hd = 0; hd < N_HEADS; hd++) {
             int hd_off = hd * HEAD_DIM;
-
             for (int d = tid; d < HEAD_DIM; d += nthreads) {
                 ws->q_head[d] = ws->q[hd_off + d];
                 ws->k_head[d] = ws->k[hd_off + d];
@@ -426,10 +363,12 @@ __device__ void decode_segment(
             }
             __syncthreads();
 
+            float* k_cache_layer = k_cache + layer * KV_CACHE_LAYER_FLOATS;
+            float* v_cache_layer = v_cache + layer * KV_CACHE_LAYER_FLOATS;
             attention_head(
                 ws->q_head, ws->k_head, ws->v_head,
-                k_cache + layer * KV_CACHE_LAYER_FLOATS + hd * (MAX_SEQ_LEN * HEAD_DIM),
-                v_cache + layer * KV_CACHE_LAYER_FLOATS + hd * (MAX_SEQ_LEN * HEAD_DIM),
+                k_cache_layer + hd * (MAX_SEQ_LEN * HEAD_DIM),
+                v_cache_layer + hd * (MAX_SEQ_LEN * HEAD_DIM),
                 seq_len, ws->out_head
             );
 
@@ -439,12 +378,9 @@ __device__ void decode_segment(
             __syncthreads();
         }
 
-        if (tid == 0) {
-            kv_len[layer] = seq_len + 1;
-        }
+        if (tid == 0) kv_len[layer] = seq_len + 1;
         __syncthreads();
 
-        // --- Attention output projection + residual ---
         gemv(ws->attn_proj, weights + off_attn_o_w(layer), ws->attn_out,
              weights + off_attn_o_b(layer), DIM, DIM);
         for (int i = tid; i < DIM; i += nthreads) {
@@ -452,15 +388,12 @@ __device__ void decode_segment(
         }
         __syncthreads();
 
-        // --- MLP path ---
         for (int i = tid; i < DIM; i += nthreads) ws->residual[i] = h[i];
         __syncthreads();
         for (int i = tid; i < DIM; i += nthreads) ws->normed[i] = h[i];
         __syncthreads();
-        layer_norm(ws->normed,
-                   weights + off_ln2_w(layer),
-                   weights + off_ln2_b(layer),
-                   DIM, EPS);
+        layer_norm(ws->normed, weights + off_ln2_w(layer),
+                   weights + off_ln2_b(layer), DIM, EPS);
 
         gemv(ws->fc1_out, weights + off_fc1_w(layer), ws->normed,
              weights + off_fc1_b(layer), FFN_DIM, DIM);
@@ -477,98 +410,139 @@ __device__ void decode_segment(
         __syncthreads();
     }
 
-    for (int i = tid; i < DIM; i += nthreads) {
-        output[i] = h[i];
-    }
+    for (int i = tid; i < DIM; i += nthreads) output[i] = h[i];
     __syncthreads();
 }
 
 // ---------------------------------------------------------------------------
-// Persistent kernel: launched ONCE, polls queue for work.
-// Instrument sigma with clock64(): cycles from observing SLOT_READY until
-// all warps are synced and about to enter decode_segment.
+// Multi-trajectory persistent kernel
 // ---------------------------------------------------------------------------
-__global__ void persistent_agent_kernel(
+//   queue: array of QueueEntry[MAX_N_TRAJ] in mapped host memory
+//   n_traj: how many slots to poll (1..MAX_N_TRAJ)
+//   weights, k_cache, v_cache, kv_len: per-trajectory KV arrays
+//   stats: array of TrajStats[MAX_N_TRAJ] (device, may be null)
+//
+__global__ void persistent_multi_agent_kernel(
     float* weights,
-    float* k_cache,
-    float* v_cache,
-    int* kv_len,
-    QueueEntry* queue,
-    KernelStats* stats              // device ptr; may be null
+    float* k_cache,           // [MAX_N_TRAJ * N_LAYERS * KV_CACHE_LAYER_FLOATS]
+    float* v_cache,           // [MAX_N_TRAJ * N_LAYERS * KV_CACHE_LAYER_FLOATS]
+    int*   kv_len,            // [MAX_N_TRAJ * N_LAYERS]
+    QueueEntry* queue,        // [MAX_N_TRAJ] mapped host memory
+    int    n_traj,
+    TrajStats* stats          // [MAX_N_TRAJ] device; may be null
 ) {
     if (blockIdx.x != 0) return;
 
-    __shared__ int s_state;
-    __shared__ unsigned long long s_t_ready;
     __shared__ DecodeWorkspace ws;
 
-    if (threadIdx.x == 0)
-        printf("persistent_kernel started, queue=%p\n", (void*)queue);
+    // Per-slot communication (set by leader thread, broadcast via __syncthreads)
+    __shared__ int      s_slot_state;
+    __shared__ int      s_slot_traj_id;
+    __shared__ int      s_slot_idx;
+    __shared__ unsigned long long s_t_ready;
 
-    // volatile: bypass L1 caching of host-mapped queue state writes
-    volatile int* queue_state = &queue->state;
+    // We need indirect access: for a given queue slot, read its volatile state.
+    // Each slot has its own state field.  We iterate i=0..n_traj-1 and check
+    // queue[i].state.  Since queue is mapped host memory, reads are uncached
+    // and we must use volatile to prevent compiler hoisting.
+    volatile int* slot_state_base = &queue[0].state;
 
     while (true) {
-        if (threadIdx.x == 0) {
-            unsigned long long poll_iter = 0;
-            while (true) {
-                int s = *queue_state;
-                if (s == SLOT_READY || s == SLOT_SHUTDOWN) {
-                    s_state = s;
-                    s_t_ready = clock64();  // first observation of READY/SHUTDOWN
-                    break;
+        bool any_work = false;
+
+        for (int i = 0; i < n_traj; i++) {
+            if (threadIdx.x == 0) {
+                int s = *(volatile int*)(slot_state_base + i * sizeof(QueueEntry) / sizeof(int));
+
+                if (s == SLOT_SHUTDOWN) {
+                    // Don't exit yet — other slots may still have work.
+                    // Flag this slot as seen-shutdown locally.
+                    s_slot_state = SLOT_SHUTDOWN;
+                    s_slot_idx = i;
+                    any_work = true;  // don't nanosleep — keep polling others
+                } else if (s == SLOT_READY) {
+                    s_slot_state = SLOT_READY;
+                    s_slot_idx = i;
+                    s_slot_traj_id = queue[i].trajectory_id;
+                    s_t_ready = clock64();
+                    any_work = true;
                 }
-                poll_iter++;
-                if ((poll_iter & 0xFFFFFF) == 0) {
-                    printf("  [kernel] polling... state=%d iter=%llu\n", s, poll_iter);
+            }
+            __syncthreads();
+
+            int state = s_slot_state;
+            if (state == SLOT_READY) {
+                int idx = s_slot_idx;
+                int tid = s_slot_traj_id;
+
+                // End of sigma window: all warps are awake and synced
+                unsigned long long t_compute_start = clock64();
+
+                // Decode this trajectory's segment
+                decode_segment(
+                    queue[idx].input,
+                    queue[idx].output,
+                    weights,
+                    k_cache + tid * N_LAYERS * KV_CACHE_LAYER_FLOATS,
+                    v_cache + tid * N_LAYERS * KV_CACHE_LAYER_FLOATS,
+                    kv_len + tid * N_LAYERS,
+                    &ws
+                );
+
+                unsigned long long t_compute_end = clock64();
+                __syncthreads();
+
+                if (threadIdx.x == 0) {
+                    // Record stats
+                    if (stats) {
+                        stats[tid].sigma_cycles_total   += (t_compute_start - s_t_ready);
+                        stats[tid].compute_cycles_total += (t_compute_end - t_compute_start);
+                        stats[tid].n_timed_steps        += 1;
+                    }
+                    // Signal done
+                    __threadfence();
+                    *(volatile int*)(slot_state_base + idx * sizeof(QueueEntry) / sizeof(int)) = SLOT_DONE;
+                    __threadfence();
                 }
-                __threadfence();
+                __syncthreads();
             }
         }
-        __syncthreads();  // broadcast s_state / s_t_ready to all warps
 
-        int s = s_state;
-        if (s == SLOT_SHUTDOWN) {
-            if (threadIdx.x == 0) printf("  [kernel] SHUTDOWN received, exiting\n");
+        // Check if ALL slots are SHUTDOWN -> exit
+        if (threadIdx.x == 0) {
+            bool all_shutdown = true;
+            for (int i = 0; i < n_traj; i++) {
+                int s = *(volatile int*)(slot_state_base + i * sizeof(QueueEntry) / sizeof(int));
+                if (s != SLOT_SHUTDOWN) {
+                    all_shutdown = false;
+                    break;
+                }
+            }
+            if (all_shutdown) {
+                s_slot_state = SLOT_SHUTDOWN;
+            } else {
+                s_slot_state = SLOT_EMPTY;  // keep going
+            }
+        }
+        __syncthreads();
+        if (s_slot_state == SLOT_SHUTDOWN) {
+            if (threadIdx.x == 0)
+                printf("  [kernel] all %d slots SHUTDOWN, exiting\n", n_traj);
             return;
         }
 
-        // All warps awake and synced: end of sigma window, start of compute.
-        unsigned long long t_compute_start = clock64();
-
-        decode_segment(
-            queue->input,
-            queue->output,
-            weights,
-            k_cache,
-            v_cache,
-            kv_len,
-            &ws
-        );
-
-        unsigned long long t_compute_end = clock64();
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            if (stats) {
-                stats->sigma_cycles_total   += (t_compute_start - s_t_ready);
-                stats->compute_cycles_total += (t_compute_end - t_compute_start);
-                stats->n_timed_steps        += 1;
-            }
-            __threadfence();
-            queue->state = SLOT_DONE;
-            __threadfence();
+        // Yield briefly if no work found this cycle
+        if (!any_work) {
+            __nanosleep(200);
         }
-        __syncthreads();
     }
 }
 
 // ---------------------------------------------------------------------------
-// Naive single-step kernel for baseline comparison
-// Same forward pass, but exits after one step (fresh launch each time).
+// Naive single-step kernel (baseline — same decode, fresh launch each step)
 // ---------------------------------------------------------------------------
 __global__ void transformer_step_kernel(
-    const float* input, float* output, float* weights,
+    const float* input, float* output, const float* weights,
     float* k_cache, float* v_cache, int* kv_len
 ) {
     __shared__ DecodeWorkspace ws;
@@ -576,38 +550,32 @@ __global__ void transformer_step_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Host: weight initialization
+// Host helpers
 // ---------------------------------------------------------------------------
 void init_weights(float* h_weights, unsigned seed = 42) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
-
     int n_floats = N_LAYERS * LAYER_FLOATS;
-    for (int i = 0; i < n_floats; i++) {
-        h_weights[i] = dist(rng);
-    }
-
-    // Initialize LayerNorm weights to 1, biases to 0
+    for (int i = 0; i < n_floats; i++) h_weights[i] = dist(rng);
     for (int layer = 0; layer < N_LAYERS; layer++) {
         float* ln1_w = h_weights + off_ln1_w(layer);
         float* ln1_b = h_weights + off_ln1_b(layer);
         float* ln2_w = h_weights + off_ln2_w(layer);
         float* ln2_b = h_weights + off_ln2_b(layer);
         for (int i = 0; i < DIM; i++) {
-            ln1_w[i] = 1.0f;
-            ln1_b[i] = 0.0f;
-            ln2_w[i] = 1.0f;
-            ln2_b[i] = 0.0f;
+            ln1_w[i] = 1.0f; ln1_b[i] = 0.0f;
+            ln2_w[i] = 1.0f; ln2_b[i] = 0.0f;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Host: main
+// Main
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     int T = 20;
     float tool_latency_ms = 20.0f;
+    int n_traj = 4;
     bool verbose = false;
     const char* json_out = nullptr;
 
@@ -616,269 +584,301 @@ int main(int argc, char** argv) {
             T = atoi(argv[++i]);
         else if (strcmp(argv[i], "--tool-latency-ms") == 0 && i + 1 < argc)
             tool_latency_ms = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--n-trajectories") == 0 && i + 1 < argc)
+            n_traj = atoi(argv[++i]);
         else if (strcmp(argv[i], "--verbose") == 0)
             verbose = true;
         else if (strcmp(argv[i], "--json-out") == 0 && i + 1 < argc)
             json_out = argv[++i];
         else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: persistent_kernel [--steps N] [--tool-latency-ms F] "
-                   "[--json-out path] [--verbose]\n");
+            printf("Usage: persistent_kernel [--steps N] [--tool-latency-ms F]\n"
+                   "       [--n-trajectories N] [--json-out path] [--verbose]\n");
             return 0;
         }
+    }
+
+    if (n_traj < 1 || n_traj > MAX_N_TRAJ) {
+        fprintf(stderr, "n_traj must be 1..%d\n", MAX_N_TRAJ);
+        return 1;
     }
 
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     int clock_rate_khz = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, 0));
-    // clockRate attribute is in kHz; clock64 ticks roughly once per SM cycle.
     double cycles_per_ms = (double)clock_rate_khz;
 
-    printf("=== Persistent Kernel: Real Transformer Decode ===\n");
+    printf("=== Multi-Trajectory Persistent Kernel ===\n");
     printf("  Device: %s (sm_%d%d), clockRate=%d kHz\n",
            prop.name, prop.major, prop.minor, clock_rate_khz);
     printf("  Model: %d layers, dim=%d, %d heads, FFN=%d\n",
            N_LAYERS, DIM, N_HEADS, FFN_DIM);
-    printf("  Steps: %d, Tool latency: %.1f ms\n", T, tool_latency_ms);
-    printf("  DecodeWorkspace shared mem: %zu bytes\n", sizeof(DecodeWorkspace));
+    printf("  Steps: %d, Tool latency: %.1f ms, Trajectories: %d\n",
+           T, tool_latency_ms, n_traj);
     printf("\n");
 
+    // --- Allocate ---
     int weights_floats = N_LAYERS * LAYER_FLOATS;
-    int kv_floats_total = N_LAYERS * N_HEADS * MAX_SEQ_LEN * HEAD_DIM;
+    int kv_floats_per_traj = N_LAYERS * KV_CACHE_LAYER_FLOATS;
+    int kv_floats_total = MAX_N_TRAJ * kv_floats_per_traj;
 
     std::vector<float> h_weights(weights_floats);
     std::vector<float> h_k_cache(kv_floats_total, 0.0f);
     std::vector<float> h_v_cache(kv_floats_total, 0.0f);
-    std::vector<int>   h_kv_len(N_LAYERS, 0);
+    std::vector<int>   h_kv_len(MAX_N_TRAJ * N_LAYERS, 0);
     init_weights(h_weights.data());
 
     float *d_weights, *d_k_cache, *d_v_cache;
     int *d_kv_len;
-    KernelStats *d_stats;
-    KernelStats h_stats = {};
-    QueueEntry *h_entry, *h_readback;
+    TrajStats *d_stats, h_stats[MAX_N_TRAJ] = {};
 
     CUDA_CHECK(cudaMalloc(&d_weights, weights_floats * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_k_cache, kv_floats_total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_v_cache, kv_floats_total * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_kv_len, N_LAYERS * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_stats, sizeof(KernelStats)));
-    CUDA_CHECK(cudaMemset(d_stats, 0, sizeof(KernelStats)));
+    CUDA_CHECK(cudaMalloc(&d_kv_len, MAX_N_TRAJ * N_LAYERS * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_stats, MAX_N_TRAJ * sizeof(TrajStats)));
+    CUDA_CHECK(cudaMemset(d_stats, 0, MAX_N_TRAJ * sizeof(TrajStats)));
 
+    // Queue: mapped host memory array of MAX_N_TRAJ entries
     QueueEntry* h_queue = nullptr;
-    QueueEntry* d_queue = nullptr;
-    CUDA_CHECK(cudaHostAlloc(&h_queue, sizeof(QueueEntry), cudaHostAllocMapped));
-    CUDA_CHECK(cudaHostGetDevicePointer(&d_queue, h_queue, 0));
-    printf("  h_queue=%p d_queue=%p\n", (void*)h_queue, (void*)d_queue);
-    CUDA_CHECK(cudaMallocHost(&h_entry, sizeof(QueueEntry)));
-    CUDA_CHECK(cudaMallocHost(&h_readback, sizeof(QueueEntry)));
+    QueueEntry* d_queue_ptr = nullptr;
+    CUDA_CHECK(cudaHostAlloc(&h_queue, MAX_N_TRAJ * sizeof(QueueEntry),
+                              cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostGetDevicePointer(&d_queue_ptr, h_queue, 0));
 
-    CUDA_CHECK(cudaMemcpy(d_weights, h_weights.data(), weights_floats * sizeof(float),
-               cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_k_cache, h_k_cache.data(), kv_floats_total * sizeof(float),
-               cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_v_cache, h_v_cache.data(), kv_floats_total * sizeof(float),
-               cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_kv_len, h_kv_len.data(), N_LAYERS * sizeof(int),
-               cudaMemcpyHostToDevice));
+    // Initialize queue
+    memset(h_queue, 0, MAX_N_TRAJ * sizeof(QueueEntry));
+    for (int i = 0; i < MAX_N_TRAJ; i++) {
+        h_queue[i].state = SLOT_EMPTY;
+        h_queue[i].trajectory_id = i;
+    }
+
+    CUDA_CHECK(cudaMemcpy(d_weights, h_weights.data(),
+               weights_floats * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k_cache, h_k_cache.data(),
+               kv_floats_total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v_cache, h_v_cache.data(),
+               kv_floats_total * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kv_len, h_kv_len.data(),
+               MAX_N_TRAJ * N_LAYERS * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    auto wait_for_state = [&](int32_t expected, int timeout_ms) -> bool {
+    auto wait_for_slot = [&](int slot, int32_t expected,
+                              int timeout_ms = 30000) -> bool {
+        auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(timeout_ms);
+        volatile int* s = &h_queue[slot].state;
+        do {
+            int v = *s;
+            if (v == expected) return true;
+            if (std::chrono::steady_clock::now() > deadline) return false;
+        } while (true);
+    };
+
+    auto wait_for_all_done = [&](int timeout_ms = 30000) -> bool {
         auto deadline = std::chrono::steady_clock::now()
                         + std::chrono::milliseconds(timeout_ms);
         do {
+            bool all_done = true;
+            for (int i = 0; i < n_traj; i++) {
+                if (h_queue[i].state != SLOT_DONE) {
+                    all_done = false;
+                    break;
+                }
+            }
+            if (all_done) return true;
             if (std::chrono::steady_clock::now() > deadline) return false;
-        } while (h_queue->state != expected);
-        return true;
+        } while (true);
     };
 
-    memset(h_queue, 0, sizeof(QueueEntry));
-    h_queue->state = SLOT_EMPTY;
-    cudaDeviceSynchronize();
+    // Reset all slots before launch
+    for (int i = 0; i < MAX_N_TRAJ; i++) {
+        memset(&h_queue[i], 0, sizeof(QueueEntry));
+        h_queue[i].state = SLOT_EMPTY;
+        h_queue[i].trajectory_id = i;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    double sigma_ms = 0.0, compute_ms = 0.0, persistent_host_ms = 0.0;
-    double naive_ms_per_step = 0.0, naive_kernel_per_step = 0.0;
-    int N_steps = 50;
+    // --- Launch persistent kernel ---
+    cudaStream_t persistent_stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&persistent_stream,
+                                          cudaStreamNonBlocking));
+    persistent_multi_agent_kernel<<<1, 256, 0, persistent_stream>>>(
+        d_weights, d_k_cache, d_v_cache, d_kv_len,
+        d_queue_ptr, n_traj, d_stats);
+    CUDA_CHECK(cudaGetLastError());
+    printf("  Persistent kernel launched (%d trajectories)\n", n_traj);
 
-    // ── Persistent kernel mode ──────────────────────────────────────────
-    {
-        std::vector<int> zero_len(N_LAYERS, 0);
-        CUDA_CHECK(cudaMemcpy(d_kv_len, zero_len.data(), N_LAYERS * sizeof(int),
-                   cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemset(d_stats, 0, sizeof(KernelStats)));
-
-        cudaStream_t persistent_stream;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&persistent_stream, cudaStreamNonBlocking));
-        persistent_agent_kernel<<<1, 256, 0, persistent_stream>>>(
-            d_weights, d_k_cache, d_v_cache, d_kv_len, d_queue, d_stats);
-        CUDA_CHECK(cudaGetLastError());
-
-        for (int t = 0; t < T; t++) {
-            auto step_start = std::chrono::high_resolution_clock::now();
-            memset(h_queue, 0, sizeof(QueueEntry));
-            h_queue->step_id = t;
-            for (int i = 0; i < DIM; i++)
-                h_queue->input[i] = 0.01f * (float)((t * DIM + i) % 100);
+    // --- Warmup / tool-latency loop ---
+    for (int t = 0; t < T; t++) {
+        // Submit all N trajectories
+        for (int i = 0; i < n_traj; i++) {
+            memset(&h_queue[i], 0, sizeof(QueueEntry));
+            h_queue[i].state = SLOT_EMPTY;
+            h_queue[i].trajectory_id = i;
+            for (int d = 0; d < DIM; d++)
+                h_queue[i].input[d] = 0.01f * (float)((t * DIM + d) % 100);
             std::atomic_signal_fence(std::memory_order_release);
-            ((volatile int32_t*)&h_queue->state)[0] = SLOT_READY;
-
-            if (!wait_for_state(SLOT_DONE, 30000)) {
-                fprintf(stderr, "FATAL: persistent kernel not responding at step %d\n", t);
-                CUDA_CHECK(cudaDeviceReset());
-                return 1;
-            }
-            auto step_end = std::chrono::high_resolution_clock::now();
-            if (verbose) {
-                double ms = std::chrono::duration<double, std::milli>(
-                                step_end - step_start).count();
-                printf("  step %d: done in %.3f ms (persistent)\n", t, ms);
-            }
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds((int)tool_latency_ms));
+            h_queue[i].state = SLOT_READY;
         }
 
-        // Timed run: reset stats so sigma excludes the tool-latency warm-up loop
-        CUDA_CHECK(cudaMemcpy(d_kv_len, zero_len.data(), N_LAYERS * sizeof(int),
-                   cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemset(d_stats, 0, sizeof(KernelStats)));
-        memset(h_queue, 0, sizeof(QueueEntry));
-        ((volatile int32_t*)&h_queue->state)[0] = SLOT_EMPTY;
-
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (int t = 0; t < N_steps; t++) {
-            memset(h_queue, 0, sizeof(QueueEntry));
-            for (int i = 0; i < DIM; i++)
-                h_queue->input[i] = 0.01f * (float)((t * DIM + i) % 100);
-            std::atomic_signal_fence(std::memory_order_release);
-            ((volatile int32_t*)&h_queue->state)[0] = SLOT_READY;
-            if (!wait_for_state(SLOT_DONE, 30000)) {
-                fprintf(stderr, "FATAL: persistent kernel not responding during timing\n");
-                CUDA_CHECK(cudaDeviceReset());
-                return 1;
-            }
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double persistent_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        persistent_host_ms = persistent_ms / N_steps;
-
-        CUDA_CHECK(cudaMemcpy(&h_stats, d_stats, sizeof(KernelStats),
-                   cudaMemcpyDeviceToHost));
-        if (h_stats.n_timed_steps > 0 && cycles_per_ms > 0.0) {
-            sigma_ms = (double)h_stats.sigma_cycles_total
-                       / (double)h_stats.n_timed_steps / cycles_per_ms;
-            compute_ms = (double)h_stats.compute_cycles_total
-                         / (double)h_stats.n_timed_steps / cycles_per_ms;
+        // Wait for all N to complete
+        if (!wait_for_all_done(60000)) {
+            fprintf(stderr, "FATAL: kernel not responding at step %d\n", t);
+            CUDA_CHECK(cudaDeviceReset());
+            return 1;
         }
 
-        memset(h_queue, 0, sizeof(QueueEntry));
-        ((volatile int32_t*)&h_queue->state)[0] = SLOT_SHUTDOWN;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        CUDA_CHECK(cudaStreamDestroy(persistent_stream));
+        if (verbose) {
+            printf("  step %d: all %d trajectories done\n", t, n_traj);
+        }
 
-        printf("\n=== Persistent kernel (%d decode steps, no tool latency) ===\n",
-               N_steps);
-        printf("  Host wall total: %.3f ms\n", persistent_ms);
-        printf("  Host wall per step: %.4f ms\n", persistent_host_ms);
-        printf("  Device clock64 sigma  (READY->sync): %.6f ms  (%.1f cycles/step)\n",
-               sigma_ms,
-               h_stats.n_timed_steps
-                   ? (double)h_stats.sigma_cycles_total / h_stats.n_timed_steps
-                   : 0.0);
-        printf("  Device clock64 compute (decode):     %.6f ms  (%.1f cycles/step)\n",
-               compute_ms,
-               h_stats.n_timed_steps
-                   ? (double)h_stats.compute_cycles_total / h_stats.n_timed_steps
-                   : 0.0);
-        printf("  Timed steps (clock64): %d\n", h_stats.n_timed_steps);
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds((int)tool_latency_ms));
     }
 
-    // ── Naive baseline ──────────────────────────────────────────────────
+    // --- Timed run ---
+    // Reset KV caches
+    std::vector<int> zero_kv(MAX_N_TRAJ * N_LAYERS, 0);
+    CUDA_CHECK(cudaMemcpy(d_kv_len, zero_kv.data(),
+               MAX_N_TRAJ * N_LAYERS * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_k_cache, 0, kv_floats_total * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_v_cache, 0, kv_floats_total * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_stats, 0, MAX_N_TRAJ * sizeof(TrajStats)));
+
+    // Reset queue
+    for (int i = 0; i < MAX_N_TRAJ; i++) {
+        memset(&h_queue[i], 0, sizeof(QueueEntry));
+        h_queue[i].state = SLOT_EMPTY;
+        h_queue[i].trajectory_id = i;
+    }
+
+    int N_timed = 50;
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    for (int t = 0; t < N_timed; t++) {
+        for (int i = 0; i < n_traj; i++) {
+            memset(&h_queue[i], 0, sizeof(QueueEntry));
+            h_queue[i].trajectory_id = i;
+            for (int d = 0; d < DIM; d++)
+                h_queue[i].input[d] = 0.01f * (float)((t * DIM + d) % 100);
+            std::atomic_signal_fence(std::memory_order_release);
+            h_queue[i].state = SLOT_READY;
+        }
+        if (!wait_for_all_done(60000)) {
+            fprintf(stderr, "FATAL during timed run\n");
+            CUDA_CHECK(cudaDeviceReset());
+            return 1;
+        }
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double wall_total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double wall_per_step = wall_total_ms / N_timed;
+
+    // Read back stats
+    CUDA_CHECK(cudaMemcpy(h_stats, d_stats,
+               MAX_N_TRAJ * sizeof(TrajStats), cudaMemcpyDeviceToHost));
+
+    // Compute per-trajectory averages
+    double avg_sigma_us = 0.0, avg_compute_us = 0.0;
+    int total_timed_steps = 0;
+    for (int i = 0; i < n_traj; i++) {
+        if (h_stats[i].n_timed_steps > 0) {
+            double s = (double)h_stats[i].sigma_cycles_total
+                       / h_stats[i].n_timed_steps / cycles_per_ms * 1000.0;
+            double c = (double)h_stats[i].compute_cycles_total
+                       / h_stats[i].n_timed_steps / cycles_per_ms * 1000.0;
+            avg_sigma_us += s;
+            avg_compute_us += c;
+            total_timed_steps += h_stats[i].n_timed_steps;
+            if (verbose) {
+                printf("  traj %d: sigma=%.4f us  compute=%.4f us  steps=%d\n",
+                       i, s, c, h_stats[i].n_timed_steps);
+            }
+        }
+    }
+    avg_sigma_us /= n_traj;
+    avg_compute_us /= n_traj;
+    double sigma_us = avg_sigma_us;
+    double compute_us = avg_compute_us;
+
+    // --- Naive baseline (single trajectory, N repeats) ---
+    double naive_kernel_only_us = 0.0;
     {
         std::vector<int> zero_len(N_LAYERS, 0);
-        CUDA_CHECK(cudaMemcpy(d_kv_len, zero_len.data(), N_LAYERS * sizeof(int),
-                   cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_kv_len, zero_len.data(),
+                   N_LAYERS * sizeof(int), cudaMemcpyHostToDevice));
 
         std::vector<float> h_input(DIM);
         float *d_input, *d_output;
         CUDA_CHECK(cudaMalloc(&d_input, DIM * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_output, DIM * sizeof(float)));
 
-        cudaEvent_t start_ev, end_ev;
-        CUDA_CHECK(cudaEventCreate(&start_ev));
-        CUDA_CHECK(cudaEventCreate(&end_ev));
+        cudaEvent_t ks, ke;
+        CUDA_CHECK(cudaEventCreate(&ks));
+        CUDA_CHECK(cudaEventCreate(&ke));
 
-        for (int i = 0; i < DIM; i++) h_input[i] = 0.01f;
-        CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), DIM * sizeof(float),
-                   cudaMemcpyHostToDevice));
-        transformer_step_kernel<<<1, 256>>>(
-            d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len);
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
+        // Use one trajectory's KV cache region for naive baseline
+        float* naive_k = d_k_cache;  // trajectory 0
+        float* naive_v = d_v_cache;
+        int* naive_len = d_kv_len;
 
-        CUDA_CHECK(cudaMemcpy(d_kv_len, zero_len.data(), N_LAYERS * sizeof(int),
-                   cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_kv_len, zero_len.data(),
+                   N_LAYERS * sizeof(int), cudaMemcpyHostToDevice));
 
-        CUDA_CHECK(cudaEventRecord(start_ev, 0));
-        for (int t = 0; t < N_steps; t++) {
-            for (int i = 0; i < DIM; i++)
-                h_input[i] = 0.01f * (float)((t * DIM + i) % 100);
-            CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), DIM * sizeof(float),
-                       cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaEventRecord(ks, 0));
+        for (int t = 0; t < N_timed; t++) {
+            h_input[0] = 0.01f * (float)(t % 100);
+            CUDA_CHECK(cudaMemcpy(d_input, h_input.data(),
+                       DIM * sizeof(float), cudaMemcpyHostToDevice));
             transformer_step_kernel<<<1, 256>>>(
-                d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len);
+                d_input, d_output, d_weights, naive_k, naive_v, naive_len);
             CUDA_CHECK(cudaGetLastError());
         }
-        CUDA_CHECK(cudaEventRecord(end_ev, 0));
-        CUDA_CHECK(cudaEventSynchronize(end_ev));
-
+        CUDA_CHECK(cudaEventRecord(ke, 0));
+        CUDA_CHECK(cudaEventSynchronize(ke));
         float naive_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&naive_ms, start_ev, end_ev));
-        naive_ms_per_step = naive_ms / N_steps;
+        CUDA_CHECK(cudaEventElapsedTime(&naive_ms, ks, ke));
+        naive_kernel_only_us = naive_ms / N_timed * 1000.0;
 
-        // Kernel-only CUDA-event timing (no H2D per step).
-        // This gives compute + launch overhead on the same wall-time clock
-        // as the total, avoiding the clock64-vs-wall-time mismatch.
-        cudaEvent_t ke_start, ke_end;
-        CUDA_CHECK(cudaEventCreate(&ke_start));
-        CUDA_CHECK(cudaEventCreate(&ke_end));
-        CUDA_CHECK(cudaEventRecord(ke_start, 0));
-        for (int t = 0; t < N_steps; t++) {
-            transformer_step_kernel<<<1, 256>>>(
-                d_input, d_output, d_weights, d_k_cache, d_v_cache, d_kv_len);
-            CUDA_CHECK(cudaGetLastError());
-        }
-        CUDA_CHECK(cudaEventRecord(ke_end, 0));
-        CUDA_CHECK(cudaEventSynchronize(ke_end));
-        float naive_kernel_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&naive_kernel_ms, ke_start, ke_end));
-        naive_kernel_per_step = naive_kernel_ms / N_steps;
-
-        CUDA_CHECK(cudaEventDestroy(start_ev));
-        CUDA_CHECK(cudaEventDestroy(end_ev));
-        CUDA_CHECK(cudaEventDestroy(ke_start));
-        CUDA_CHECK(cudaEventDestroy(ke_end));
+        CUDA_CHECK(cudaEventDestroy(ks));
+        CUDA_CHECK(cudaEventDestroy(ke));
         CUDA_CHECK(cudaFree(d_input));
         CUDA_CHECK(cudaFree(d_output));
-
-        printf("\n=== Naive (relaunch-per-step, %d decode steps) ===\n", N_steps);
-        printf("  Total (H2D + launch + compute): %.3f ms\n", naive_ms);
-        printf("  Per step (H2D + launch + compute): %.4f ms\n", naive_ms_per_step);
-        printf("  Kernel-only (launch + compute, CUDA event): %.4f ms/step\n", naive_kernel_per_step);
     }
 
-    double compute_ms_cuda_events = naive_kernel_per_step;
-    double kappa_ms = naive_ms_per_step - compute_ms_cuda_events;
-    if (kappa_ms < 0.0) kappa_ms = 0.0;
+    // --- Compute derived quantities ---
+    // kappa = naive kernel-only per step
+    double kappa_us = naive_kernel_only_us;
 
-    printf("\n=== Derived overheads (real forward pass) ===\n");
-    printf("  compute (CUDA event, naive kernel-only): %.6f ms\n", compute_ms_cuda_events);
-    printf("  compute (clock64, persistent kernel):    %.6f ms (cross-check)\n", compute_ms);
-    printf("  Total naive per step:                    %.6f ms\n", naive_ms_per_step);
-    printf("  kappa (naive total - kernel-only cuda):  %.6f ms\n", kappa_ms);
-    printf("  sigma (clock64 device-side):             %.6f ms\n", sigma_ms);
-    printf("  kappa/sigma ratio:                       %.1fx\n",
-           sigma_ms > 0.0 ? kappa_ms / sigma_ms : 0.0);
+    // Multi-trajectory analysis
+    double per_traj_per_step_persistent_us = (wall_per_step * 1000.0) / n_traj;
+    double per_traj_per_step_naive_us = kappa_us + compute_us;
+    double delta_us_per_traj_step = per_traj_per_step_naive_us - per_traj_per_step_persistent_us;
+    double delta_us_total = (kappa_us * n_traj) - (kappa_us + sigma_us * n_traj);
 
+    printf("\n=== Results (N=%d, %d steps) ===\n", n_traj, N_timed);
+    printf("  Wall total:               %.3f ms\n", wall_total_ms);
+    printf("  Wall per step (all traj): %.4f ms\n", wall_per_step);
+    printf("  Wall per traj per step:   %.4f us\n", per_traj_per_step_persistent_us);
+    printf("\n  sigma (clock64 avg):      %.6f us\n", sigma_us);
+    printf("  compute (clock64 avg):    %.6f us\n", compute_us);
+    printf("  kappa (naive kernel-only):%.6f us\n", kappa_us);
+    printf("\n  Delta per traj step:      %.4f us\n", delta_us_per_traj_step);
+    printf("  Delta total (vs Nxnaive): %.4f us\n", delta_us_total);
+    printf("  %saving:                   %.4f%%\n",
+           delta_us_total > 0 ? "S" : "S",
+           delta_us_total / (kappa_us * n_traj + compute_us * n_traj) * 100.0);
+
+    // --- Shutdown ---
+    for (int i = 0; i < n_traj; i++) {
+        h_queue[i].state = SLOT_SHUTDOWN;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CUDA_CHECK(cudaStreamDestroy(persistent_stream));
+
+    // --- JSON output ---
     if (json_out) {
         FILE* f = fopen(json_out, "w");
         if (f) {
@@ -888,48 +888,38 @@ int main(int argc, char** argv) {
                 "  \"sm\": \"%d%d\",\n"
                 "  \"clock_rate_khz\": %d,\n"
                 "  \"model\": {\"n_layers\": %d, \"dim\": %d, \"n_heads\": %d, \"ffn_dim\": %d},\n"
+                "  \"n_trajectories\": %d,\n"
                 "  \"n_steps\": %d,\n"
-                "  \"sigma_ms\": %.8f,\n"
-                "  \"sigma_source\": \"clock64_device_side_queue_poll\",\n"
-                "  \"clock64_compute_ms\": %.8f,\n"
-                "  \"clock64_compute_source\": \"clock64_decode_segment\",\n"
-                "  \"cuda_event_compute_ms\": %.8f,\n"
-                "  \"cuda_event_compute_source\": \"naive_kernel_only_cuda_event\",\n"
-                "  \"naive_ms_per_step\": %.8f,\n"
-                "  \"persistent_host_ms_per_step\": %.8f,\n"
-                "  \"kappa_ms\": %.8f,\n"
-                "  \"kappa_source\": \"naive_total_minus_kernel_only_cuda_event\",\n"
-                "  \"sigma_cycles_total\": %llu,\n"
-                "  \"compute_cycles_total\": %llu,\n"
-                "  \"n_timed_steps\": %d\n"
+                "  \"wall_total_ms\": %.6f,\n"
+                "  \"wall_per_step_ms\": %.6f,\n"
+                "  \"sigma_us\": %.8f,\n"
+                "  \"compute_us\": %.8f,\n"
+                "  \"kappa_us\": %.8f,\n"
+                "  \"delta_us_per_traj_step\": %.8f,\n"
+                "  \"delta_us_total\": %.8f,\n"
+                "  \"saving_pct\": %.4f\n"
                 "}\n",
                 prop.name, prop.major, prop.minor, clock_rate_khz,
                 N_LAYERS, DIM, N_HEADS, FFN_DIM,
-                N_steps,
-                sigma_ms, compute_ms,
-                compute_ms_cuda_events,
-                naive_ms_per_step, persistent_host_ms,
-                kappa_ms,
-                (unsigned long long)h_stats.sigma_cycles_total,
-                (unsigned long long)h_stats.compute_cycles_total,
-                h_stats.n_timed_steps);
+                n_traj, N_timed,
+                wall_total_ms, wall_per_step,
+                sigma_us, compute_us, kappa_us,
+                delta_us_per_traj_step,
+                delta_us_total,
+                delta_us_total / (kappa_us * n_traj + compute_us * n_traj) * 100.0);
             fclose(f);
             printf("\nWrote %s\n", json_out);
-        } else {
-            fprintf(stderr, "WARNING: could not write %s\n", json_out);
         }
     }
 
+    // --- Cleanup ---
     CUDA_CHECK(cudaFree(d_weights));
     CUDA_CHECK(cudaFree(d_k_cache));
     CUDA_CHECK(cudaFree(d_v_cache));
     CUDA_CHECK(cudaFree(d_kv_len));
     CUDA_CHECK(cudaFree(d_stats));
     CUDA_CHECK(cudaFreeHost(h_queue));
-    CUDA_CHECK(cudaFreeHost(h_entry));
-    CUDA_CHECK(cudaFreeHost(h_readback));
 
     printf("\nDone.\n");
     return 0;
 }
-
