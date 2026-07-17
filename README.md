@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="agent-loop-visual.svg">
-    <img src="agent-loop-visual.svg" width="100%" alt="Persistent Kernel Scheduling for Agent Loops">
-  </picture>
+  <img src="agent-loop-visual.svg" width="100%" alt="Persistent Kernel Scheduling for Agent Loops">
 </p>
 
 <p align="center">
