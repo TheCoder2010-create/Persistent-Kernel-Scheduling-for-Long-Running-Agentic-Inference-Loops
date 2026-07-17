@@ -1,0 +1,10 @@
+=== Multi-Trajectory Persistent Kernel ===
+  Device: NVIDIA GeForce RTX 4050 Laptop GPU (sm_89), clockRate=1605000 kHz
+  Model: 2 layers, dim=256, 4 heads, FFN=1024
+  Steps: 2, Tool latency: 0.1 ms, Trajectories: 1
+
+  h_queue=0000000204C00000 d_queue_ptr=0000000204C00000 sizeof(Entry)=2064
+  Persistent kernel launched (1 trajectories)
+  step 0 slot 0: wrote READY, readback=1
+  step 0: waiting for all done...
+  [kernel] started, queue[0].state=0

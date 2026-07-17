@@ -1,0 +1,18 @@
+=== Multi-Trajectory Persistent Kernel ===
+  Device: NVIDIA GeForce RTX 4050 Laptop GPU (sm_89), clockRate=1605000 kHz
+  Model: 2 layers, dim=256, 4 heads, FFN=1024
+  Steps: 2, Tool latency: 0.5 ms, Trajectories: 1
+
+  h_queue=0000000204C00000 d_queue=0000000204C00000 sizeof(Entry)=2064
+  Warmup: launching kernel for 2 steps
+  traj 0: compute=1075.4963 us  steps=50
+
+=== Results (N=1, 50 steps) ===
+  One-launch total:         53.811 ms
+  Wall per step:            1076.2260 us
+  compute (clock64):        1075.4963 us
+  kappa (naive single):     1102.8479 us
+  Amortized cost/step:     1076.2260 us  (kappa + compute)/step
+  Launch saving vs naive:  26.6219 us/step  (2.4%)
+
+Done.
